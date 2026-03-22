@@ -1,9 +1,9 @@
 /**
  * Lyria 3 Music Generator — Core Engine
  * 
- * Uses Playwright + CDP (Chrome DevTools Protocol) to generate music via Gemini.
- * Audio capture: CDP Network.responseReceived + Network.getResponseBody to grab
- * the actual binary audio data at the protocol level.
+ * Uses Playwright to generate music via Gemini.
+ * Audio download: uses Playwright's APIRequestContext (page.request) to download
+ * with proper cookies and session, avoiding the broken page.evaluate(fetch) approach.
  */
 
 import { chromium } from 'playwright';
@@ -171,20 +171,13 @@ async function createAuthenticatedContext(browser) {
 function isAudioContent(buffer) {
   if (!buffer || buffer.length < 12) return false;
   const h = buffer;
-  // ID3 tag (MP3)
-  if (h[0] === 0x49 && h[1] === 0x44 && h[2] === 0x33) return true;
-  // MP3 sync
-  if (h[0] === 0xFF && (h[1] & 0xE0) === 0xE0) return true;
-  // MP4/M4A ftyp
-  if (h[4] === 0x66 && h[5] === 0x74 && h[6] === 0x79 && h[7] === 0x70) return true;
-  // WebM EBML
-  if (h[0] === 0x1A && h[1] === 0x45 && h[2] === 0xDF && h[3] === 0xA3) return true;
-  // OGG
-  if (h[0] === 0x4F && h[1] === 0x67 && h[2] === 0x67 && h[3] === 0x53) return true;
-  // WAV RIFF
-  if (h[0] === 0x52 && h[1] === 0x49 && h[2] === 0x46 && h[3] === 0x46) return true;
-  // FLAC
-  if (h[0] === 0x66 && h[1] === 0x4C && h[2] === 0x61 && h[3] === 0x43) return true;
+  if (h[0] === 0x49 && h[1] === 0x44 && h[2] === 0x33) return true; // ID3 (MP3)
+  if (h[0] === 0xFF && (h[1] & 0xE0) === 0xE0) return true; // MP3 sync
+  if (h[4] === 0x66 && h[5] === 0x74 && h[6] === 0x79 && h[7] === 0x70) return true; // MP4/M4A ftyp
+  if (h[0] === 0x1A && h[1] === 0x45 && h[2] === 0xDF && h[3] === 0xA3) return true; // WebM
+  if (h[0] === 0x4F && h[1] === 0x67 && h[2] === 0x67 && h[3] === 0x53) return true; // OGG
+  if (h[0] === 0x52 && h[1] === 0x49 && h[2] === 0x46 && h[3] === 0x46) return true; // WAV
+  if (h[0] === 0x66 && h[1] === 0x4C && h[2] === 0x61 && h[3] === 0x43) return true; // FLAC
   return false;
 }
 
@@ -194,104 +187,27 @@ function isHtmlContent(buffer) {
   return start.includes('<!doctype') || start.includes('<html') || start.includes('<?xml');
 }
 
-// ─── Core Generation with CDP ───────────────────────────────────────────────
+// ─── Core Generation ────────────────────────────────────────────────────────
 
 async function generateWithPlaywright(job) {
   const browser = await getBrowser();
   const context = await createAuthenticatedContext(browser);
   let page = null;
   
-  // Audio data captured via CDP
-  let capturedAudioBuffer = null;
-  
-  // Track all network responses via CDP for audio content
-  const cdpResponseBodies = new Map(); // requestId -> {url, contentType, contentLength}
-  
   try {
     page = await context.newPage();
-    
-    // Get CDP session for low-level network interception
-    const cdpSession = await page.context().newCDPSession(page);
-    
-    // Enable Network domain to intercept all responses
-    await cdpSession.send('Network.enable', {
-      maxResourceBufferSize: 10 * 1024 * 1024,  // 10MB buffer
-      maxTotalBufferSize: 50 * 1024 * 1024,      // 50MB total
-    });
-    
-    // Track responses that might contain audio
-    cdpSession.on('Network.responseReceived', (params) => {
-      const { requestId, response } = params;
-      const url = response.url;
-      const contentType = (response.headers['content-type'] || response.headers['Content-Type'] || '').toLowerCase();
-      const contentLength = parseInt(response.headers['content-length'] || response.headers['Content-Length'] || '0');
-      
-      // Track ANY response that could be audio/video
-      const isMedia = contentType.includes('audio/') || 
-                      contentType.includes('video/') ||
-                      contentType.includes('octet-stream') ||
-                      contentType.includes('application/mp4') ||
-                      url.includes('.mp3') || url.includes('.mp4') || 
-                      url.includes('.wav') || url.includes('.webm') ||
-                      url.includes('.ogg') || url.includes('.m4a') ||
-                      url.includes('.opus');
-      
-      if (isMedia) {
-        console.log(`[CDP] Media response: ${url.substring(0, 120)} (type: ${contentType}, size: ${contentLength})`);
-        cdpResponseBodies.set(requestId, { url, contentType, contentLength });
-      }
-    });
-    
-    // When loading finishes, try to get the body
-    cdpSession.on('Network.loadingFinished', async (params) => {
-      const { requestId, encodedDataLength } = params;
-      const info = cdpResponseBodies.get(requestId);
-      
-      if (info && encodedDataLength > 5000) {
-        try {
-          const { body, base64Encoded } = await cdpSession.send('Network.getResponseBody', { requestId });
-          const buffer = base64Encoded ? Buffer.from(body, 'base64') : Buffer.from(body);
-          
-          if (buffer.length > 10000 && !isHtmlContent(buffer)) {
-            if (isAudioContent(buffer)) {
-              console.log(`[CDP] ✅ CAPTURED AUDIO via Network.getResponseBody: ${info.url.substring(0, 100)} (${buffer.length} bytes, type: ${info.contentType})`);
-              capturedAudioBuffer = buffer;
-            } else if (info.contentType.includes('audio/') || info.contentType.includes('video/')) {
-              // Trust content-type even if magic bytes don't match known formats
-              console.log(`[CDP] ✅ CAPTURED AUDIO (by content-type): ${info.url.substring(0, 100)} (${buffer.length} bytes, type: ${info.contentType})`);
-              capturedAudioBuffer = buffer;
-            }
-          }
-        } catch (e) {
-          // Some responses can't be retrieved (e.g., streaming) — that's OK
-          if (!e.message.includes('No resource with given identifier') && !e.message.includes('No data found')) {
-            console.log(`[CDP] Could not get body for ${info.url.substring(0, 80)}: ${e.message}`);
-          }
-        }
-      }
-    });
     
     // Navigate to Gemini
     console.log(`[Generator] Navigating to Gemini...`);
     await page.goto(GEMINI_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(3000);
     
-    // Screenshot for debugging
-    const navScreenshot = path.join(os.tmpdir(), `lyria3-nav-${job.id}.png`);
-    await page.screenshot({ path: navScreenshot });
-    console.log(`[Generator] Navigation screenshot: ${navScreenshot}`);
-    
-    // Check if we're on Gemini (not a login page)
-    const pageTitle = await page.title();
-    console.log(`[Generator] Page title: ${pageTitle}`);
-    
-    // Click "Create music" if available
-    console.log(`[Generator] Looking for music creation mode...`);
+    // Click "Create music" mode button
+    console.log(`[Generator] Activating music creation mode...`);
     const musicButton = await page.$('button:has-text("Create music"), [aria-label*="music"], [data-test-id*="music"]');
     if (musicButton) {
       await musicButton.click();
       await page.waitForTimeout(2000);
-      console.log(`[Generator] Clicked music creation button`);
     } else {
       const chips = await page.$$('button, [role="button"]');
       for (const chip of chips) {
@@ -299,7 +215,6 @@ async function generateWithPlaywright(job) {
         if (text && text.toLowerCase().includes('music')) {
           await chip.click();
           await page.waitForTimeout(2000);
-          console.log(`[Generator] Clicked chip: ${text}`);
           break;
         }
       }
@@ -325,7 +240,6 @@ async function generateWithPlaywright(job) {
         await page.waitForTimeout(500);
         await page.keyboard.type(job.prompt, { delay: 20 });
         inputFound = true;
-        console.log(`[Generator] Input found with selector: ${selector}`);
         break;
       }
     }
@@ -336,165 +250,59 @@ async function generateWithPlaywright(job) {
     
     await page.waitForTimeout(1000);
     
-    // Submit
+    // Submit the prompt
     console.log(`[Generator] Submitting prompt...`);
     await page.keyboard.press('Enter');
     
-    // Wait for generation — poll for CDP-captured audio or DOM audio elements
+    // Wait for music generation (30-120 seconds)
     console.log(`[Generator] Waiting for music generation (up to 3 minutes)...`);
+    
     const startTime = Date.now();
-    let clickedPlay = false;
+    let audioUrl = null;
     
     while (Date.now() - startTime < GENERATION_TIMEOUT) {
       await page.waitForTimeout(5000);
       
-      // Check if CDP already captured audio
-      if (capturedAudioBuffer && capturedAudioBuffer.length > 10000) {
-        console.log(`[Generator] Audio captured via CDP! (${capturedAudioBuffer.length} bytes)`);
+      // Check for audio/video elements with src
+      audioUrl = await page.evaluate(() => {
+        // Strategy 1: audio/video elements
+        const media = document.querySelectorAll('audio source, video source, audio[src], video[src]');
+        for (const el of media) {
+          const src = el.getAttribute('src') || '';
+          if (src && (src.includes('usercontent.google') || src.includes('blob:') || src.includes('googleusercontent'))) {
+            return src;
+          }
+        }
+        
+        // Strategy 2: download links
+        const links = document.querySelectorAll('a[href*="download"], a[href*="usercontent"]');
+        for (const link of links) {
+          const href = link.getAttribute('href') || '';
+          if (href && href.includes('google')) {
+            return href;
+          }
+        }
+        
+        // Strategy 3: data attributes on play buttons
+        const playButtons = document.querySelectorAll('[data-track-url], [data-audio-url], [data-src]');
+        for (const btn of playButtons) {
+          const url = btn.getAttribute('data-track-url') || btn.getAttribute('data-audio-url') || btn.getAttribute('data-src') || '';
+          if (url) return url;
+        }
+        
+        return null;
+      });
+      
+      if (audioUrl) {
+        console.log(`[Generator] Found audio URL: ${audioUrl.substring(0, 120)}...`);
         break;
       }
       
-      // Check DOM for audio/video elements or play buttons
-      const domState = await page.evaluate(() => {
-        const result = { audioSrcs: [], playButtons: 0, hasMedia: false };
-        
-        // Check audio/video elements
-        const media = document.querySelectorAll('audio, video, audio source, video source');
-        for (const el of media) {
-          const src = el.getAttribute('src') || el.src || '';
-          if (src) {
-            result.audioSrcs.push(src.substring(0, 150));
-            result.hasMedia = true;
-          }
-        }
-        
-        // Check play buttons
-        const playBtns = document.querySelectorAll(
-          '[aria-label*="Play"], [aria-label*="play"], [data-track-url], [data-audio-url]'
-        );
-        result.playButtons = playBtns.length;
-        if (playBtns.length > 0) result.hasMedia = true;
-        
-        return result;
-      });
-      
-      if (domState.hasMedia && !clickedPlay) {
-        console.log(`[Generator] Media detected in DOM! Sources: ${JSON.stringify(domState.audioSrcs)}, Play buttons: ${domState.playButtons}`);
-        
-        // Click play to trigger the audio network request (which CDP will intercept)
-        console.log(`[Generator] Clicking play to trigger audio download...`);
-        await page.evaluate(() => {
-          // Click play buttons
-          const playBtns = document.querySelectorAll(
-            '[aria-label*="Play"], [aria-label*="play"], [data-track-url], [data-audio-url]'
-          );
-          for (const btn of playBtns) { btn.click(); break; }
-          
-          // Try playing media elements directly
-          const media = document.querySelectorAll('audio, video');
-          for (const el of media) {
-            try { el.play(); } catch(e) {}
-          }
-        });
-        clickedPlay = true;
-        
-        // Wait for CDP to capture the audio stream
-        await page.waitForTimeout(8000);
-        
-        if (capturedAudioBuffer && capturedAudioBuffer.length > 10000) {
-          console.log(`[Generator] Audio captured after clicking play! (${capturedAudioBuffer.length} bytes)`);
-          break;
-        }
-        
-        // If CDP didn't catch it, the audio might be in a blob: URL
-        // Use page.evaluate to read the blob and send it back
-        console.log(`[Generator] CDP didn't capture audio. Trying blob extraction from media elements...`);
-        
-        const blobResult = await page.evaluate(async () => {
-          const results = [];
-          
-          // Try all audio/video elements
-          const media = document.querySelectorAll('audio, video');
-          for (const el of media) {
-            const src = el.src || el.querySelector('source')?.src || '';
-            if (!src) continue;
-            
-            try {
-              // For blob: URLs, fetch the blob directly
-              if (src.startsWith('blob:')) {
-                const resp = await fetch(src);
-                const blob = await resp.blob();
-                // Check if it's actually audio (not HTML)
-                if (blob.type && (blob.type.includes('audio') || blob.type.includes('video') || blob.type.includes('octet'))) {
-                  const ab = await blob.arrayBuffer();
-                  const bytes = Array.from(new Uint8Array(ab));
-                  return { bytes, type: blob.type, size: blob.size, source: 'blob:' + src.substring(5, 30) };
-                }
-                // Even if type is empty, check the bytes
-                const ab = await blob.arrayBuffer();
-                const first4 = new Uint8Array(ab.slice(0, 4));
-                // Check for non-HTML content (not starting with '<')
-                if (first4[0] !== 0x3C && ab.byteLength > 10000) {
-                  const bytes = Array.from(new Uint8Array(ab));
-                  return { bytes, type: blob.type || 'unknown', size: ab.byteLength, source: 'blob-raw' };
-                }
-              }
-              
-              // For http(s) URLs
-              if (src.startsWith('http')) {
-                const resp = await fetch(src, { credentials: 'include' });
-                const ct = resp.headers.get('content-type') || '';
-                if (ct.includes('audio') || ct.includes('video') || ct.includes('octet')) {
-                  const ab = await resp.arrayBuffer();
-                  const bytes = Array.from(new Uint8Array(ab));
-                  return { bytes, type: ct, size: ab.byteLength, source: 'http' };
-                }
-              }
-            } catch (e) {
-              results.push({ error: e.message, src: src.substring(0, 50) });
-            }
-          }
-          
-          return null;
-        }).catch(() => null);
-        
-        if (blobResult && blobResult.bytes && blobResult.bytes.length > 10000) {
-          const buf = Buffer.from(blobResult.bytes);
-          if (!isHtmlContent(buf)) {
-            console.log(`[Generator] Got audio via blob extraction (${blobResult.source}): ${buf.length} bytes, type: ${blobResult.type}`);
-            capturedAudioBuffer = buf;
-            break;
-          } else {
-            console.warn(`[Generator] Blob extraction returned HTML content (${buf.length} bytes)`);
-          }
-        }
-        
-        // Last resort: try to download via the page's download mechanism
-        console.log(`[Generator] Trying download button...`);
-        const downloadClicked = await page.evaluate(() => {
-          const dlBtns = document.querySelectorAll(
-            '[aria-label*="Download"], [aria-label*="download"], a[download], button:has-text("Download")'
-          );
-          for (const btn of dlBtns) { btn.click(); return true; }
-          return false;
-        });
-        
-        if (downloadClicked) {
-          console.log(`[Generator] Clicked download button, waiting for file...`);
-          await page.waitForTimeout(5000);
-          
-          if (capturedAudioBuffer && capturedAudioBuffer.length > 10000) {
-            console.log(`[Generator] Audio captured via download! (${capturedAudioBuffer.length} bytes)`);
-            break;
-          }
-        }
-      }
-      
-      // Check for errors
+      // Check for error messages
       const hasError = await page.evaluate(() => {
-        const errorTexts = ['something went wrong', 'try again', 'unable to generate', "can't generate"];
+        const errorTexts = ['something went wrong', 'try again', 'unable to generate'];
         const bodyText = document.body.innerText.toLowerCase();
-        return errorTexts.some(t => bodyText.includes(t));
+        return errorTexts.some(t => bodyText.includes(t) && bodyText.indexOf(t) > bodyText.length - 500);
       });
       
       if (hasError) {
@@ -502,74 +310,211 @@ async function generateWithPlaywright(job) {
       }
       
       const elapsed = Math.round((Date.now() - startTime) / 1000);
-      console.log(`[Generator] Still waiting... (${elapsed}s, captured: ${capturedAudioBuffer ? capturedAudioBuffer.length + 'B' : 'none'}, cdpTracked: ${cdpResponseBodies.size})`);
+      console.log(`[Generator] Still waiting... (${elapsed}s elapsed)`);
     }
     
-    // Final check
-    if (!capturedAudioBuffer || capturedAudioBuffer.length < 10000) {
-      // Take debug screenshot
-      const screenshotPath = path.join(os.tmpdir(), `lyria3-debug-${job.id}-${Date.now()}.png`);
+    if (!audioUrl) {
+      const screenshotPath = path.join(os.tmpdir(), `lyria3-debug-${Date.now()}.png`);
       await page.screenshot({ path: screenshotPath, fullPage: true });
+      console.warn(`[Generator] Debug screenshot saved: ${screenshotPath}`);
+      throw new Error('Music generation timed out — no audio URL found after 3 minutes');
+    }
+    
+    // ─── DOWNLOAD THE AUDIO ─────────────────────────────────────────────
+    // The old code used page.evaluate(fetch(url)) which returned HTML.
+    // Now we use multiple strategies to get the actual audio bytes.
+    
+    job.status = 'downloading';
+    const tempFile = path.join(os.tmpdir(), `lyria3-${job.id}-${Date.now()}.mp4`);
+    let downloadedBuffer = null;
+    
+    // Strategy 1: Use Playwright's download event — click the download button
+    console.log(`[Generator] Attempting download via Playwright download event...`);
+    try {
+      const [download] = await Promise.all([
+        page.waitForEvent('download', { timeout: 15000 }),
+        page.evaluate(() => {
+          // Click any download button/link
+          const dlBtns = document.querySelectorAll(
+            'a[href*="download"], [aria-label*="Download"], [aria-label*="download"], button:has-text("Download")'
+          );
+          for (const btn of dlBtns) { btn.click(); return true; }
+          
+          // If no download button, try right-click save on audio element
+          const audio = document.querySelector('audio, video');
+          if (audio && audio.src) {
+            const a = document.createElement('a');
+            a.href = audio.src;
+            a.download = 'music.mp4';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            return true;
+          }
+          return false;
+        }),
+      ]);
       
-      // Log detailed page state
-      const pageState = await page.evaluate(() => {
-        const audioEls = document.querySelectorAll('audio, video');
-        const sources = [];
-        audioEls.forEach(el => {
-          sources.push({
-            tag: el.tagName,
-            src: (el.src || '').substring(0, 150),
-            childSources: Array.from(el.querySelectorAll('source')).map(s => (s.src || '').substring(0, 150)),
-            paused: el.paused,
-            duration: el.duration,
-            readyState: el.readyState,
-          });
+      if (download) {
+        const downloadPath = path.join(os.tmpdir(), `lyria3-dl-${job.id}-${Date.now()}`);
+        await download.saveAs(downloadPath);
+        downloadedBuffer = fs.readFileSync(downloadPath);
+        console.log(`[Generator] Downloaded via Playwright event: ${downloadedBuffer.length} bytes`);
+        fs.unlinkSync(downloadPath);
+        
+        if (isHtmlContent(downloadedBuffer)) {
+          console.warn(`[Generator] Download event returned HTML (${downloadedBuffer.length} bytes) — trying next strategy`);
+          downloadedBuffer = null;
+        }
+      }
+    } catch (e) {
+      console.log(`[Generator] Download event strategy failed: ${e.message} — trying next strategy`);
+    }
+    
+    // Strategy 2: Use context.request (Playwright APIRequestContext) to fetch with cookies
+    if (!downloadedBuffer && audioUrl.startsWith('http')) {
+      console.log(`[Generator] Attempting download via Playwright APIRequestContext...`);
+      try {
+        const response = await context.request.get(audioUrl, {
+          maxRedirects: 5,
+          timeout: 30000,
         });
         
-        // Also check for any large data URLs or blob URLs in the page
-        const allElements = document.querySelectorAll('[src], [data-src], [href]');
-        const mediaUrls = [];
-        allElements.forEach(el => {
-          const src = el.getAttribute('src') || el.getAttribute('data-src') || el.getAttribute('href') || '';
-          if (src.includes('blob:') || src.includes('.mp3') || src.includes('.mp4') || 
-              src.includes('.wav') || src.includes('.webm') || src.includes('audio') ||
-              src.includes('usercontent.google')) {
-            mediaUrls.push(src.substring(0, 150));
+        downloadedBuffer = Buffer.from(await response.body());
+        const contentType = response.headers()['content-type'] || '';
+        console.log(`[Generator] APIRequestContext response: ${response.status()} ${contentType} (${downloadedBuffer.length} bytes)`);
+        
+        if (isHtmlContent(downloadedBuffer)) {
+          console.warn(`[Generator] APIRequestContext returned HTML (${downloadedBuffer.length} bytes) — trying next strategy`);
+          downloadedBuffer = null;
+        }
+      } catch (e) {
+        console.log(`[Generator] APIRequestContext strategy failed: ${e.message} — trying next strategy`);
+      }
+    }
+    
+    // Strategy 3: Use page.evaluate with blob: URL handling
+    if (!downloadedBuffer && audioUrl.startsWith('blob:')) {
+      console.log(`[Generator] Attempting blob: URL extraction...`);
+      try {
+        const blobData = await page.evaluate(async (url) => {
+          const resp = await fetch(url);
+          const blob = await resp.blob();
+          const ab = await blob.arrayBuffer();
+          const bytes = Array.from(new Uint8Array(ab));
+          return { bytes, type: blob.type, size: ab.byteLength };
+        }, audioUrl);
+        
+        if (blobData && blobData.bytes.length > 5000) {
+          downloadedBuffer = Buffer.from(blobData.bytes);
+          console.log(`[Generator] Blob extraction: ${downloadedBuffer.length} bytes, type: ${blobData.type}`);
+          
+          if (isHtmlContent(downloadedBuffer)) {
+            console.warn(`[Generator] Blob returned HTML — trying next strategy`);
+            downloadedBuffer = null;
+          }
+        }
+      } catch (e) {
+        console.log(`[Generator] Blob extraction failed: ${e.message} — trying next strategy`);
+      }
+    }
+    
+    // Strategy 4: Use Node.js fetch with cookies from context
+    if (!downloadedBuffer && audioUrl.startsWith('http')) {
+      console.log(`[Generator] Attempting download via Node.js fetch with cookies...`);
+      try {
+        const contextCookies = await context.cookies();
+        const cookieHeader = contextCookies
+          .filter(c => audioUrl.includes(c.domain.replace(/^\./, '')))
+          .map(c => `${c.name}=${c.value}`)
+          .join('; ');
+        
+        const response = await fetch(audioUrl, {
+          headers: {
+            'Cookie': cookieHeader,
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Accept': 'audio/*, video/*, application/octet-stream, */*',
+            'Referer': 'https://gemini.google.com/',
+          },
+          redirect: 'follow',
+        });
+        
+        const ab = await response.arrayBuffer();
+        downloadedBuffer = Buffer.from(ab);
+        const contentType = response.headers.get('content-type') || '';
+        console.log(`[Generator] Node fetch: ${response.status} ${contentType} (${downloadedBuffer.length} bytes)`);
+        
+        if (isHtmlContent(downloadedBuffer)) {
+          console.warn(`[Generator] Node fetch returned HTML (${downloadedBuffer.length} bytes) — trying next strategy`);
+          downloadedBuffer = null;
+        }
+      } catch (e) {
+        console.log(`[Generator] Node fetch failed: ${e.message} — trying next strategy`);
+      }
+    }
+    
+    // Strategy 5: Use CDP to navigate to the URL and capture the response
+    if (!downloadedBuffer && audioUrl.startsWith('http')) {
+      console.log(`[Generator] Attempting download via CDP navigation...`);
+      try {
+        const dlPage = await context.newPage();
+        const cdpSession = await dlPage.context().newCDPSession(dlPage);
+        await cdpSession.send('Network.enable', { maxResourceBufferSize: 10 * 1024 * 1024 });
+        
+        let capturedRequestId = null;
+        cdpSession.on('Network.responseReceived', (params) => {
+          if (params.response.url.includes('download') || params.response.url === audioUrl) {
+            capturedRequestId = params.requestId;
           }
         });
         
-        return {
-          title: document.title,
-          url: window.location.href,
-          audioElements: sources,
-          mediaUrls,
-          bodyTextLength: document.body.innerText.length,
-        };
-      });
-      
-      console.error(`[Generator] FAILED — Debug screenshot: ${screenshotPath}`);
-      console.error(`[Generator] Page state:`, JSON.stringify(pageState, null, 2));
-      console.error(`[Generator] CDP tracked ${cdpResponseBodies.size} media responses`);
-      
-      // List all tracked CDP responses
-      for (const [reqId, info] of cdpResponseBodies) {
-        console.error(`[CDP] Tracked: ${info.url.substring(0, 120)} (type: ${info.contentType}, size: ${info.contentLength})`);
+        await dlPage.goto(audioUrl, { waitUntil: 'load', timeout: 30000 }).catch(() => {});
+        await dlPage.waitForTimeout(3000);
+        
+        if (capturedRequestId) {
+          try {
+            const { body, base64Encoded } = await cdpSession.send('Network.getResponseBody', { requestId: capturedRequestId });
+            downloadedBuffer = base64Encoded ? Buffer.from(body, 'base64') : Buffer.from(body);
+            console.log(`[Generator] CDP navigation: ${downloadedBuffer.length} bytes`);
+            
+            if (isHtmlContent(downloadedBuffer)) {
+              console.warn(`[Generator] CDP navigation returned HTML — giving up`);
+              downloadedBuffer = null;
+            }
+          } catch (e) {
+            console.log(`[Generator] CDP getResponseBody failed: ${e.message}`);
+          }
+        }
+        
+        await dlPage.close().catch(() => {});
+      } catch (e) {
+        console.log(`[Generator] CDP navigation failed: ${e.message}`);
       }
-      
-      throw new Error(`Music generation failed — no audio captured. Page: ${pageState.title}, Audio elements: ${pageState.audioElements.length}, Media URLs: ${pageState.mediaUrls.length}, CDP tracked: ${cdpResponseBodies.size}`);
     }
     
-    // Validate
-    if (isHtmlContent(capturedAudioBuffer)) {
-      throw new Error('Captured content is HTML, not audio — Gemini session may have expired');
+    // Final validation
+    if (!downloadedBuffer || downloadedBuffer.length < 5000) {
+      // Save debug screenshot
+      const screenshotPath = path.join(os.tmpdir(), `lyria3-dl-debug-${job.id}-${Date.now()}.png`);
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+      console.error(`[Generator] All download strategies failed. Debug screenshot: ${screenshotPath}`);
+      console.error(`[Generator] Audio URL was: ${audioUrl}`);
+      throw new Error(`All audio download strategies failed for URL: ${audioUrl.substring(0, 80)}`);
     }
     
-    // Save to temp file
-    job.status = 'downloading';
-    const tempFile = path.join(os.tmpdir(), `lyria3-${job.id}-${Date.now()}.mp4`);
-    fs.writeFileSync(tempFile, capturedAudioBuffer);
+    if (isHtmlContent(downloadedBuffer)) {
+      throw new Error(`Downloaded content is HTML (${downloadedBuffer.length} bytes), not audio — Gemini page was captured instead of audio stream`);
+    }
     
-    console.log(`[Generator] Saved ${capturedAudioBuffer.length} bytes to ${tempFile}`);
+    // Save to file
+    fs.writeFileSync(tempFile, downloadedBuffer);
+    console.log(`[Generator] Saved ${downloadedBuffer.length} bytes to ${tempFile}`);
+    
+    if (isAudioContent(downloadedBuffer)) {
+      console.log(`[Generator] ✅ Audio magic bytes confirmed`);
+    } else {
+      console.log(`[Generator] ⚠️ Unknown format — first 8 bytes: ${downloadedBuffer.slice(0, 8).toString('hex')}`);
+    }
     
     // Verify with ffprobe if available
     try {
@@ -577,7 +522,7 @@ async function generateWithPlaywright(job) {
       const info = JSON.parse(probe.toString());
       console.log(`[Generator] ffprobe: format=${info.format?.format_name}, duration=${info.format?.duration}s, size=${info.format?.size}`);
     } catch (e) {
-      console.log(`[Generator] ffprobe not available or failed — skipping validation`);
+      console.log(`[Generator] ffprobe check skipped`);
     }
     
     return tempFile;
@@ -668,7 +613,6 @@ async function uploadToStorage(filePath, jobId) {
     }
   }
   
-  // Fallback: local file served via /api/download/:id
   console.warn('[Generator] No S3/upload configured. File saved locally:', filePath);
   return `local://${filePath}`;
 }
