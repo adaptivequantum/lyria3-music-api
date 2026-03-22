@@ -1,9 +1,14 @@
 /**
- * Lyria 3 Music Generator — Core Engine
+ * Lyria 3 Music Generator — Core Engine (v2)
  * 
- * Uses Playwright to generate music via Gemini.
- * Audio download: uses Playwright's APIRequestContext (page.request) to download
- * with proper cookies and session, avoiding the broken page.evaluate(fetch) approach.
+ * Uses Playwright to generate music via Gemini's Lyria 3 model.
+ * 
+ * PROVEN DOWNLOAD APPROACH (March 2026):
+ * - Music is served as a <video> element inside <video-player> component
+ * - Video src = https://contribution.usercontent.google.com/download?c=[TOKEN]&filename=[NAME].mp4&opi=[ID]
+ * - Download via context.request.get(video.src) — includes session cookies automatically
+ * - Backup: page.evaluate(fetch(videoUrl, {credentials:'include'}))
+ * - The "Download track" button has "active-lock" class and may be disabled — DO NOT rely on clicking it
  */
 
 import { chromium } from 'playwright';
@@ -146,6 +151,7 @@ async function createAuthenticatedContext(browser) {
     locale: 'en-US',
   });
   
+  // Playwright cookies need: name, value, domain, path. Optional: secure, httpOnly, expires, sameSite
   const validCookies = cookies
     .filter(c => c.value && c.name && c.domain)
     .map(c => ({
@@ -156,6 +162,7 @@ async function createAuthenticatedContext(browser) {
       secure: c.secure ?? true,
       httpOnly: c.httpOnly ?? false,
       expires: c.expirationDate > 0 ? c.expirationDate : (c.expires > 0 ? c.expires : undefined),
+      sameSite: c.sameSite || 'Lax',
     }));
   
   if (validCookies.length > 0) {
@@ -171,13 +178,20 @@ async function createAuthenticatedContext(browser) {
 function isAudioContent(buffer) {
   if (!buffer || buffer.length < 12) return false;
   const h = buffer;
-  if (h[0] === 0x49 && h[1] === 0x44 && h[2] === 0x33) return true; // ID3 (MP3)
-  if (h[0] === 0xFF && (h[1] & 0xE0) === 0xE0) return true; // MP3 sync
-  if (h[4] === 0x66 && h[5] === 0x74 && h[6] === 0x79 && h[7] === 0x70) return true; // MP4/M4A ftyp
-  if (h[0] === 0x1A && h[1] === 0x45 && h[2] === 0xDF && h[3] === 0xA3) return true; // WebM
-  if (h[0] === 0x4F && h[1] === 0x67 && h[2] === 0x67 && h[3] === 0x53) return true; // OGG
-  if (h[0] === 0x52 && h[1] === 0x49 && h[2] === 0x46 && h[3] === 0x46) return true; // WAV
-  if (h[0] === 0x66 && h[1] === 0x4C && h[2] === 0x61 && h[3] === 0x43) return true; // FLAC
+  // MP4/M4A ftyp box: bytes 4-7 = "ftyp"
+  if (h[4] === 0x66 && h[5] === 0x74 && h[6] === 0x79 && h[7] === 0x70) return true;
+  // ID3 (MP3)
+  if (h[0] === 0x49 && h[1] === 0x44 && h[2] === 0x33) return true;
+  // MP3 sync
+  if (h[0] === 0xFF && (h[1] & 0xE0) === 0xE0) return true;
+  // WebM
+  if (h[0] === 0x1A && h[1] === 0x45 && h[2] === 0xDF && h[3] === 0xA3) return true;
+  // OGG
+  if (h[0] === 0x4F && h[1] === 0x67 && h[2] === 0x67 && h[3] === 0x53) return true;
+  // WAV
+  if (h[0] === 0x52 && h[1] === 0x49 && h[2] === 0x46 && h[3] === 0x46) return true;
+  // FLAC
+  if (h[0] === 0x66 && h[1] === 0x4C && h[2] === 0x61 && h[3] === 0x43) return true;
   return false;
 }
 
@@ -202,34 +216,36 @@ async function generateWithPlaywright(job) {
     await page.goto(GEMINI_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(3000);
     
-    // Click "Create music" mode button
-    console.log(`[Generator] Activating music creation mode...`);
-    const musicButton = await page.$('button:has-text("Create music"), [aria-label*="music"], [data-test-id*="music"]');
-    if (musicButton) {
-      await musicButton.click();
-      await page.waitForTimeout(2000);
-    } else {
-      const chips = await page.$$('button, [role="button"]');
-      for (const chip of chips) {
-        const text = await chip.textContent().catch(() => '');
-        if (text && text.toLowerCase().includes('music')) {
-          await chip.click();
-          await page.waitForTimeout(2000);
-          break;
-        }
-      }
+    // Check if we're logged in (look for sign-in button or user avatar)
+    const isLoggedIn = await page.evaluate(() => {
+      const bodyText = document.body.innerText.toLowerCase();
+      // If we see "sign in" prominently, we're not logged in
+      const signInBtn = document.querySelector('a[href*="accounts.google.com/ServiceLogin"]');
+      if (signInBtn) return false;
+      // If we see the prompt input, we're logged in
+      const input = document.querySelector('div[contenteditable="true"], [aria-label*="prompt" i]');
+      return !!input;
+    });
+    
+    if (!isLoggedIn) {
+      const screenshotPath = path.join(os.tmpdir(), `lyria3-not-logged-in-${Date.now()}.png`);
+      await page.screenshot({ path: screenshotPath });
+      console.error(`[Generator] NOT LOGGED IN! Screenshot: ${screenshotPath}`);
+      throw new Error('Not logged into Gemini — cookies may be expired. Re-upload fresh cookies via POST /api/cookies');
     }
     
-    // Type the prompt
+    console.log(`[Generator] Logged in to Gemini successfully`);
+    
+    // Type the prompt into the contenteditable input
     console.log(`[Generator] Typing prompt: ${job.prompt.substring(0, 80)}...`);
     
     const inputSelectors = [
+      'rich-textarea div[contenteditable="true"]',
       'div[contenteditable="true"]',
+      '[role="textbox"]',
       'textarea',
-      '.ql-editor',
-      '[aria-label*="prompt"]',
-      '[aria-label*="message"]',
-      'rich-textarea',
+      '[aria-label*="prompt" i]',
+      '[aria-label*="message" i]',
     ];
     
     let inputFound = false;
@@ -240,6 +256,7 @@ async function generateWithPlaywright(job) {
         await page.waitForTimeout(500);
         await page.keyboard.type(job.prompt, { delay: 20 });
         inputFound = true;
+        console.log(`[Generator] Input found with selector: ${selector}`);
         break;
       }
     }
@@ -254,48 +271,68 @@ async function generateWithPlaywright(job) {
     console.log(`[Generator] Submitting prompt...`);
     await page.keyboard.press('Enter');
     
-    // Wait for music generation — detect the track card appearing (not a URL)
+    // ─── WAIT FOR MUSIC GENERATION ──────────────────────────────────
+    // The track is ready when a <video> element appears with a src from
+    // contribution.usercontent.google.com, or when buttons like
+    // "Download track", "Play video", or "Listen" appear.
+    
     console.log(`[Generator] Waiting for music generation (up to 3 minutes)...`);
     
     const startTime = Date.now();
-    let trackReady = false;
+    let videoSrc = null;
     
     while (Date.now() - startTime < GENERATION_TIMEOUT) {
       await page.waitForTimeout(5000);
       
-      // Check if a music track card has appeared by looking for download/play buttons
-      // or audio/video elements that indicate generation is complete
-      trackReady = await page.evaluate(() => {
-        // Check for download icon/button on the track card
-        const dlBtns = document.querySelectorAll('[aria-label*="ownload"], [aria-label*="save"], [data-tooltip*="ownload"]');
-        if (dlBtns.length > 0) return true;
-        
-        // Check for audio/video elements
-        const media = document.querySelectorAll('audio, video');
-        for (const el of media) {
-          if (el.src || el.querySelector('source')) return true;
+      // Check for video element with src (the primary signal)
+      const mediaInfo = await page.evaluate(() => {
+        const video = document.querySelector('video');
+        if (video && video.src && video.src.startsWith('http')) {
+          return { src: video.src, duration: video.duration || 0 };
         }
         
-        // Check for play button that appears on generated track
-        const playBtns = document.querySelectorAll('[aria-label*="lay"], [aria-label*="isten"]');
-        for (const btn of playBtns) {
-          const text = (btn.getAttribute('aria-label') || '').toLowerCase();
-          if (text.includes('play') || text.includes('listen')) return true;
-        }
+        // Fallback: check for download/play buttons as secondary signal
+        const dlBtn = document.querySelector('[aria-label="Download track"]');
+        const playBtn = document.querySelector('[aria-label="Play video"]');
+        const listenBtn = document.querySelector('[aria-label="Listen"]');
         
-        return false;
+        return {
+          src: null,
+          hasDownload: !!dlBtn,
+          hasPlay: !!playBtn,
+          hasListen: !!listenBtn,
+        };
       });
       
-      if (trackReady) {
-        console.log(`[Generator] Track card detected — music generation complete!`);
+      if (mediaInfo.src) {
+        videoSrc = mediaInfo.src;
+        console.log(`[Generator] Video element found! src: ${videoSrc.substring(0, 100)}...`);
         break;
+      }
+      
+      if (mediaInfo.hasDownload || mediaInfo.hasPlay) {
+        // Buttons appeared but video src not yet available — wait a bit more
+        console.log(`[Generator] Track buttons detected, waiting for video src...`);
+        await page.waitForTimeout(3000);
+        
+        // Try again to get video src
+        const recheck = await page.evaluate(() => {
+          const video = document.querySelector('video');
+          return video && video.src && video.src.startsWith('http') ? video.src : null;
+        });
+        
+        if (recheck) {
+          videoSrc = recheck;
+          console.log(`[Generator] Video src found on recheck: ${videoSrc.substring(0, 100)}...`);
+          break;
+        }
       }
       
       // Check for error messages
       const hasError = await page.evaluate(() => {
-        const errorTexts = ['something went wrong', 'try again', 'unable to generate', 'can\'t create music'];
+        const errorTexts = ['something went wrong', 'try again', 'unable to generate', "can't create music", 'error'];
         const bodyText = document.body.innerText.toLowerCase();
-        return errorTexts.some(t => bodyText.includes(t));
+        return errorTexts.some(t => bodyText.includes(t) && !bodyText.includes('gemini can make mistakes'));
       });
       
       if (hasError) {
@@ -306,281 +343,192 @@ async function generateWithPlaywright(job) {
       console.log(`[Generator] Still waiting... (${elapsed}s elapsed)`);
     }
     
-    if (!trackReady) {
-      const screenshotPath = path.join(os.tmpdir(), `lyria3-debug-${Date.now()}.png`);
+    if (!videoSrc) {
+      // Last attempt: screenshot and check one more time
+      const screenshotPath = path.join(os.tmpdir(), `lyria3-timeout-${job.id}-${Date.now()}.png`);
       await page.screenshot({ path: screenshotPath, fullPage: true });
-      console.warn(`[Generator] Debug screenshot saved: ${screenshotPath}`);
-      throw new Error('Music generation timed out — no track card found after 3 minutes');
+      console.error(`[Generator] Timeout screenshot: ${screenshotPath}`);
+      
+      // One final check
+      videoSrc = await page.evaluate(() => {
+        const video = document.querySelector('video');
+        return video && video.src && video.src.startsWith('http') ? video.src : null;
+      });
+      
+      if (!videoSrc) {
+        throw new Error('Music generation timed out — no video element found after 3 minutes');
+      }
     }
     
-    // Take a screenshot of the completed track for debugging
-    const trackScreenshot = path.join(os.tmpdir(), `lyria3-track-${job.id}-${Date.now()}.png`);
-    await page.screenshot({ path: trackScreenshot, fullPage: true });
-    console.log(`[Generator] Track screenshot saved: ${trackScreenshot}`);
-    
-    // Log what we can see on the page for debugging
-    const pageInfo = await page.evaluate(() => {
-      const info = { downloadButtons: [], audioElements: [], allButtons: [] };
-      
-      // Find all buttons with aria-labels
-      document.querySelectorAll('[aria-label]').forEach(el => {
-        const label = el.getAttribute('aria-label');
-        if (label) info.allButtons.push({ tag: el.tagName, label, href: el.getAttribute('href') || '' });
-      });
-      
-      // Find download-related elements
-      document.querySelectorAll('[aria-label*="ownload"], [aria-label*="save"], [data-tooltip*="ownload"], a[download]').forEach(el => {
-        info.downloadButtons.push({
-          tag: el.tagName,
-          label: el.getAttribute('aria-label') || '',
-          href: el.getAttribute('href') || '',
-          tooltip: el.getAttribute('data-tooltip') || '',
-        });
-      });
-      
-      // Find audio/video elements
-      document.querySelectorAll('audio, video').forEach(el => {
-        info.audioElements.push({
-          tag: el.tagName,
-          src: el.src || '',
-          sources: Array.from(el.querySelectorAll('source')).map(s => s.src),
-        });
-      });
-      
-      return info;
-    });
-    console.log(`[Generator] Page info: ${JSON.stringify(pageInfo).substring(0, 1000)}`);
-    
-    // ─── DOWNLOAD THE AUDIO ─────────────────────────────────────────────
-    // Use Playwright's download event by clicking the actual download button.
-    // Gemini shows a download icon on the track card.
+    // ─── DOWNLOAD THE AUDIO ─────────────────────────────────────────
+    // PROVEN APPROACH: Use context.request.get() which carries all session cookies.
+    // The video src URL requires Google authentication cookies to download.
+    // Direct curl/wget without cookies returns HTML login page.
     
     job.status = 'downloading';
-    const tempFile = path.join(os.tmpdir(), `lyria3-${job.id}-${Date.now()}.mp4`);
+    console.log(`[Generator] Downloading audio from: ${videoSrc.substring(0, 100)}...`);
+    
     let downloadedBuffer = null;
     
-    // Strategy 1: Click download button using Playwright (not page.evaluate) + capture download event
-    console.log(`[Generator] Strategy 1: Playwright click download button + download event...`);
+    // Strategy 1 (PRIMARY): context.request.get() — Playwright's built-in HTTP client with cookies
+    console.log(`[Generator] Strategy 1: context.request.get()...`);
     try {
-      // Find the download button using Playwright selectors (supports :has-text, aria-label, etc.)
-      const downloadButton = await page.$('[aria-label*="ownload"]') 
-        || await page.$('[data-tooltip*="ownload"]')
-        || await page.$('button:has-text("Download")')
-        || await page.$('a[download]')
-        || await page.$('[aria-label*="save"]');
+      const response = await context.request.get(videoSrc, {
+        maxRedirects: 5,
+        timeout: 60000,
+      });
       
-      if (downloadButton) {
-        console.log(`[Generator] Found download button, clicking...`);
-        const [download] = await Promise.all([
-          page.waitForEvent('download', { timeout: 15000 }),
-          downloadButton.click(),
-        ]);
+      if (response.ok()) {
+        const body = await response.body();
+        const contentType = response.headers()['content-type'] || '';
+        console.log(`[Generator] Strategy 1: ${body.length} bytes, Content-Type: ${contentType}`);
         
-        if (download) {
-          const downloadPath = path.join(os.tmpdir(), `lyria3-dl-${job.id}-${Date.now()}`);
-          await download.saveAs(downloadPath);
-          downloadedBuffer = fs.readFileSync(downloadPath);
-          console.log(`[Generator] Downloaded via Playwright event: ${downloadedBuffer.length} bytes`);
-          fs.unlinkSync(downloadPath);
-          
-          if (isHtmlContent(downloadedBuffer)) {
-            console.warn(`[Generator] Download returned HTML — trying next strategy`);
-            downloadedBuffer = null;
-          }
+        if (body.length > 5000 && !isHtmlContent(body)) {
+          downloadedBuffer = body;
+          console.log(`[Generator] Strategy 1 SUCCESS: ${downloadedBuffer.length} bytes`);
+        } else if (isHtmlContent(body)) {
+          console.warn(`[Generator] Strategy 1: Got HTML response (${body.length} bytes) — cookies may be invalid`);
+        } else {
+          console.warn(`[Generator] Strategy 1: Response too small (${body.length} bytes)`);
         }
       } else {
-        console.log(`[Generator] No download button found via Playwright selectors`);
+        console.warn(`[Generator] Strategy 1: HTTP ${response.status()}`);
       }
     } catch (e) {
-      console.log(`[Generator] Strategy 1 failed: ${e.message}`);
+      console.warn(`[Generator] Strategy 1 failed: ${e.message}`);
     }
     
-    // Strategy 2: If download button click didn't trigger a download event,
-    // maybe it opened a dialog (MP4 vs MP3 choice). Look for the dialog options.
+    // Strategy 2 (BACKUP): page.evaluate(fetch) with credentials
     if (!downloadedBuffer) {
-      console.log(`[Generator] Strategy 2: Check for download format dialog (MP4/MP3 choice)...`);
+      console.log(`[Generator] Strategy 2: page.evaluate(fetch with credentials)...`);
       try {
-        await page.waitForTimeout(2000);
+        const fetchResult = await page.evaluate(async (url) => {
+          try {
+            const resp = await fetch(url, {
+              credentials: 'include',
+              headers: { 'Accept': '*/*' },
+            });
+            if (!resp.ok) return { error: `HTTP ${resp.status}`, size: 0 };
+            const blob = await resp.blob();
+            const ab = await blob.arrayBuffer();
+            return {
+              bytes: Array.from(new Uint8Array(ab)),
+              type: blob.type,
+              size: ab.byteLength,
+            };
+          } catch (e) {
+            return { error: e.message, size: 0 };
+          }
+        }, videoSrc);
         
-        // Look for MP3 option in a dialog/menu
-        const mp3Option = await page.$('text=MP3')
-          || await page.$('text=Audio only')
-          || await page.$('text=audio')
-          || await page.$('[aria-label*="MP3"]')
-          || await page.$('[aria-label*="audio only"]');
-        
-        if (mp3Option) {
-          console.log(`[Generator] Found MP3/audio option in dialog, clicking...`);
-          const [download] = await Promise.all([
-            page.waitForEvent('download', { timeout: 15000 }),
-            mp3Option.click(),
-          ]);
+        if (fetchResult.error) {
+          console.warn(`[Generator] Strategy 2 error: ${fetchResult.error}`);
+        } else if (fetchResult.size > 5000) {
+          downloadedBuffer = Buffer.from(fetchResult.bytes);
+          console.log(`[Generator] Strategy 2 SUCCESS: ${downloadedBuffer.length} bytes, type: ${fetchResult.type}`);
           
-          if (download) {
-            const downloadPath = path.join(os.tmpdir(), `lyria3-dl2-${job.id}-${Date.now()}`);
-            await download.saveAs(downloadPath);
-            downloadedBuffer = fs.readFileSync(downloadPath);
-            console.log(`[Generator] Downloaded MP3 via dialog: ${downloadedBuffer.length} bytes`);
-            fs.unlinkSync(downloadPath);
-            
-            if (isHtmlContent(downloadedBuffer)) {
-              console.warn(`[Generator] Dialog download returned HTML — trying next strategy`);
-              downloadedBuffer = null;
-            }
+          if (isHtmlContent(downloadedBuffer)) {
+            console.warn(`[Generator] Strategy 2: Content is HTML, discarding`);
+            downloadedBuffer = null;
           }
         } else {
-          // Maybe no dialog, try clicking any visible download-like button again
-          const anyDlBtn = await page.$('[aria-label*="ownload"]:visible')
-            || await page.$('a[href*="usercontent"]');
-          if (anyDlBtn) {
-            const href = await anyDlBtn.getAttribute('href');
-            if (href && href.includes('usercontent')) {
-              console.log(`[Generator] Found usercontent link: ${href.substring(0, 100)}`);
-              // This is likely a direct download link
-              const response = await context.request.get(href, { maxRedirects: 5, timeout: 30000 });
-              downloadedBuffer = Buffer.from(await response.body());
-              console.log(`[Generator] Downloaded from usercontent: ${downloadedBuffer.length} bytes`);
-              if (isHtmlContent(downloadedBuffer)) {
-                downloadedBuffer = null;
-              }
-            }
-          }
+          console.warn(`[Generator] Strategy 2: Too small (${fetchResult.size} bytes)`);
         }
       } catch (e) {
-        console.log(`[Generator] Strategy 2 failed: ${e.message}`);
+        console.warn(`[Generator] Strategy 2 failed: ${e.message}`);
       }
     }
     
-    // Strategy 3: Extract audio from video/audio element src (blob or http)
+    // Strategy 3 (LAST RESORT): Click download button + capture Playwright download event
     if (!downloadedBuffer) {
-      console.log(`[Generator] Strategy 3: Extract from audio/video element...`);
+      console.log(`[Generator] Strategy 3: Click download button...`);
       try {
-        const mediaSrc = await page.evaluate(() => {
-          const media = document.querySelector('audio, video');
-          if (media) {
-            const source = media.querySelector('source');
-            return media.src || (source && source.src) || null;
-          }
-          return null;
-        });
-        
-        if (mediaSrc) {
-          console.log(`[Generator] Found media src: ${mediaSrc.substring(0, 100)}`);
-          
-          if (mediaSrc.startsWith('blob:')) {
-            // Extract blob data from inside the page
-            const blobData = await page.evaluate(async (url) => {
-              try {
-                const resp = await fetch(url);
-                const blob = await resp.blob();
-                const ab = await blob.arrayBuffer();
-                return { bytes: Array.from(new Uint8Array(ab)), type: blob.type, size: ab.byteLength };
-              } catch (e) {
-                return null;
-              }
-            }, mediaSrc);
-            
-            if (blobData && blobData.bytes.length > 5000) {
-              downloadedBuffer = Buffer.from(blobData.bytes);
-              console.log(`[Generator] Blob extraction: ${downloadedBuffer.length} bytes, type: ${blobData.type}`);
-              if (isHtmlContent(downloadedBuffer)) downloadedBuffer = null;
-            }
-          } else if (mediaSrc.startsWith('http')) {
-            const response = await context.request.get(mediaSrc, { maxRedirects: 5, timeout: 30000 });
-            downloadedBuffer = Buffer.from(await response.body());
-            console.log(`[Generator] Media src download: ${downloadedBuffer.length} bytes`);
-            if (isHtmlContent(downloadedBuffer)) downloadedBuffer = null;
-          }
-        }
-      } catch (e) {
-        console.log(`[Generator] Strategy 3 failed: ${e.message}`);
-      }
-    }
-    
-    // Strategy 4: Use MediaRecorder to capture audio output from the page
-    if (!downloadedBuffer) {
-      console.log(`[Generator] Strategy 4: MediaRecorder capture...`);
-      try {
-        // First, try to play the audio
-        await page.evaluate(() => {
-          const media = document.querySelector('audio, video');
-          if (media) { media.currentTime = 0; media.play(); }
-          // Also try clicking play button
-          const playBtn = document.querySelector('[aria-label*="lay"]');
-          if (playBtn) playBtn.click();
-        });
-        
-        // Use MediaRecorder to capture the audio stream
-        const audioData = await page.evaluate(() => {
-          return new Promise((resolve, reject) => {
-            const media = document.querySelector('audio, video');
-            if (!media || !media.captureStream) {
-              reject(new Error('No media element with captureStream'));
-              return;
-            }
-            
-            const stream = media.captureStream();
-            const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-            const chunks = [];
-            
-            recorder.ondataavailable = (e) => {
-              if (e.data.size > 0) chunks.push(e.data);
-            };
-            
-            recorder.onstop = async () => {
-              const blob = new Blob(chunks, { type: 'audio/webm' });
-              const ab = await blob.arrayBuffer();
-              resolve({ bytes: Array.from(new Uint8Array(ab)), type: 'audio/webm', size: ab.byteLength });
-            };
-            
-            media.currentTime = 0;
-            media.play();
-            recorder.start();
-            
-            // Record for the duration of the track (max 35 seconds)
-            const duration = Math.min((media.duration || 30) * 1000 + 2000, 35000);
-            setTimeout(() => {
-              recorder.stop();
-              media.pause();
-            }, duration);
-            
-            // Timeout safety
-            setTimeout(() => reject(new Error('MediaRecorder timeout')), 40000);
+        const dlBtn = await page.$('[aria-label="Download track"]');
+        if (dlBtn) {
+          // Check if button is enabled
+          const isDisabled = await dlBtn.evaluate(el => {
+            return el.disabled || el.classList.contains('active-lock') || el.getAttribute('aria-disabled') === 'true';
           });
-        });
-        
-        if (audioData && audioData.bytes.length > 5000) {
-          downloadedBuffer = Buffer.from(audioData.bytes);
-          console.log(`[Generator] MediaRecorder captured: ${downloadedBuffer.length} bytes, type: ${audioData.type}`);
-          if (isHtmlContent(downloadedBuffer)) downloadedBuffer = null;
+          
+          if (!isDisabled) {
+            await dlBtn.click();
+            await page.waitForTimeout(2000);
+            
+            // Look for "Audio only" or "MP3" option in the dropdown menu
+            const mp3Option = await page.$('text=Audio only')
+              || await page.$('text=MP3')
+              || await page.$('[role="menuitem"]:has-text("Audio")');
+            
+            if (mp3Option) {
+              const [download] = await Promise.all([
+                page.waitForEvent('download', { timeout: 15000 }),
+                mp3Option.click(),
+              ]);
+              
+              if (download) {
+                const downloadPath = path.join(os.tmpdir(), `lyria3-dl-${job.id}-${Date.now()}`);
+                await download.saveAs(downloadPath);
+                downloadedBuffer = fs.readFileSync(downloadPath);
+                console.log(`[Generator] Strategy 3 SUCCESS: ${downloadedBuffer.length} bytes`);
+                fs.unlinkSync(downloadPath);
+                
+                if (isHtmlContent(downloadedBuffer)) {
+                  console.warn(`[Generator] Strategy 3: Got HTML, discarding`);
+                  downloadedBuffer = null;
+                }
+              }
+            } else {
+              // No menu appeared, try direct download
+              const [download] = await Promise.all([
+                page.waitForEvent('download', { timeout: 15000 }),
+                dlBtn.click(),
+              ]);
+              
+              if (download) {
+                const downloadPath = path.join(os.tmpdir(), `lyria3-dl-${job.id}-${Date.now()}`);
+                await download.saveAs(downloadPath);
+                downloadedBuffer = fs.readFileSync(downloadPath);
+                console.log(`[Generator] Strategy 3 (direct): ${downloadedBuffer.length} bytes`);
+                fs.unlinkSync(downloadPath);
+                
+                if (isHtmlContent(downloadedBuffer)) {
+                  downloadedBuffer = null;
+                }
+              }
+            }
+          } else {
+            console.log(`[Generator] Strategy 3: Download button is disabled (active-lock)`);
+          }
+        } else {
+          console.log(`[Generator] Strategy 3: No download button found`);
         }
       } catch (e) {
-        console.log(`[Generator] Strategy 4 failed: ${e.message}`);
+        console.warn(`[Generator] Strategy 3 failed: ${e.message}`);
       }
     }
     
-    // Final validation
+    // ─── VALIDATE DOWNLOAD ──────────────────────────────────────────
+    
     if (!downloadedBuffer || downloadedBuffer.length < 5000) {
-      // Save debug screenshot
-      const screenshotPath = path.join(os.tmpdir(), `lyria3-dl-debug-${job.id}-${Date.now()}.png`);
+      const screenshotPath = path.join(os.tmpdir(), `lyria3-dl-fail-${job.id}-${Date.now()}.png`);
       await page.screenshot({ path: screenshotPath, fullPage: true });
-      console.error(`[Generator] All download strategies failed. Debug screenshot: ${screenshotPath}`);
-      console.error(`[Generator] Audio URL was: ${audioUrl}`);
-      throw new Error(`All audio download strategies failed for URL: ${audioUrl.substring(0, 80)}`);
+      console.error(`[Generator] All download strategies failed. Screenshot: ${screenshotPath}`);
+      throw new Error(`All audio download strategies failed. Video src was: ${videoSrc.substring(0, 80)}`);
     }
     
     if (isHtmlContent(downloadedBuffer)) {
-      throw new Error(`Downloaded content is HTML (${downloadedBuffer.length} bytes), not audio — Gemini page was captured instead of audio stream`);
+      throw new Error(`Downloaded content is HTML (${downloadedBuffer.length} bytes), not audio — session cookies may be expired`);
     }
     
-    // Save to file
+    // Save to temp file
+    const tempFile = path.join(os.tmpdir(), `lyria3-${job.id}-${Date.now()}.mp4`);
     fs.writeFileSync(tempFile, downloadedBuffer);
     console.log(`[Generator] Saved ${downloadedBuffer.length} bytes to ${tempFile}`);
     
     if (isAudioContent(downloadedBuffer)) {
-      console.log(`[Generator] ✅ Audio magic bytes confirmed`);
+      console.log(`[Generator] Audio magic bytes confirmed`);
     } else {
-      console.log(`[Generator] ⚠️ Unknown format — first 8 bytes: ${downloadedBuffer.slice(0, 8).toString('hex')}`);
+      console.log(`[Generator] Unknown format — first 8 bytes: ${downloadedBuffer.slice(0, 8).toString('hex')}`);
     }
     
     // Verify with ffprobe if available
@@ -589,7 +537,7 @@ async function generateWithPlaywright(job) {
       const info = JSON.parse(probe.toString());
       console.log(`[Generator] ffprobe: format=${info.format?.format_name}, duration=${info.format?.duration}s, size=${info.format?.size}`);
     } catch (e) {
-      console.log(`[Generator] ffprobe check skipped`);
+      console.log(`[Generator] ffprobe check skipped (not installed or failed)`);
     }
     
     return tempFile;
@@ -600,11 +548,14 @@ async function generateWithPlaywright(job) {
   }
 }
 
+// ─── MP4 → MP3 Conversion ──────────────────────────────────────────────────
+
 function convertToMp3(inputPath) {
   const outputPath = inputPath.replace(/\.mp4$/, '.mp3');
   
-  console.log(`[Generator] Converting to MP3: ${inputPath}`);
+  console.log(`[Generator] Converting MP4 to MP3: ${inputPath}`);
   
+  // Try full re-encode to MP3
   try {
     execSync(
       `ffmpeg -y -i "${inputPath}" -vn -acodec libmp3lame -ab 192k -ar 44100 "${outputPath}" 2>/dev/null`,
@@ -617,20 +568,22 @@ function convertToMp3(inputPath) {
       return outputPath;
     }
   } catch (err) {
-    console.warn(`[Generator] ffmpeg conversion failed, trying direct copy...`);
+    console.warn(`[Generator] ffmpeg re-encode failed, trying stream copy...`);
   }
   
+  // Try extracting audio stream without re-encoding
   try {
     execSync(
       `ffmpeg -y -i "${inputPath}" -vn -c:a copy "${outputPath}" 2>/dev/null`,
       { timeout: 30000 }
     );
     if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 1000) {
+      console.log(`[Generator] Audio extracted (copy): ${outputPath} (${fs.statSync(outputPath).size} bytes)`);
       fs.unlinkSync(inputPath);
       return outputPath;
     }
   } catch {
-    console.warn('[Generator] All conversion attempts failed, returning original file');
+    console.warn('[Generator] All conversion attempts failed, returning original MP4');
   }
   
   return inputPath;
@@ -645,10 +598,12 @@ async function uploadToStorage(filePath, jobId) {
   const S3_SECRET_KEY = process.env.S3_SECRET_KEY;
   
   if (S3_BUCKET && S3_ACCESS_KEY) {
-    const key = `lyria3-music/${jobId}-${Date.now()}.mp3`;
+    const ext = filePath.endsWith('.mp3') ? 'mp3' : 'mp4';
+    const contentType = ext === 'mp3' ? 'audio/mpeg' : 'audio/mp4';
+    const key = `lyria3-music/${jobId}-${Date.now()}.${ext}`;
     try {
       execSync(
-        `AWS_ACCESS_KEY_ID="${S3_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${S3_SECRET_KEY}" aws s3 cp "${filePath}" "s3://${S3_BUCKET}/${key}" --region "${S3_REGION || 'us-east-1'}" --content-type "audio/mpeg" --acl public-read 2>/dev/null`,
+        `AWS_ACCESS_KEY_ID="${S3_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${S3_SECRET_KEY}" aws s3 cp "${filePath}" "s3://${S3_BUCKET}/${key}" --region "${S3_REGION || 'us-east-1'}" --content-type "${contentType}" --acl public-read 2>/dev/null`,
         { timeout: 30000 }
       );
       const url = `https://${S3_BUCKET}.s3.${S3_REGION || 'us-east-1'}.amazonaws.com/${key}`;
@@ -663,8 +618,9 @@ async function uploadToStorage(filePath, jobId) {
   if (UPLOAD_URL) {
     try {
       const fileBuffer = fs.readFileSync(filePath);
+      const ext = filePath.endsWith('.mp3') ? 'mp3' : 'mp4';
       const formData = new FormData();
-      formData.append('file', new Blob([fileBuffer], { type: 'audio/mpeg' }), `${jobId}.mp3`);
+      formData.append('file', new Blob([fileBuffer], { type: ext === 'mp3' ? 'audio/mpeg' : 'audio/mp4' }), `${jobId}.${ext}`);
       
       const response = await fetch(UPLOAD_URL, {
         method: 'POST',
