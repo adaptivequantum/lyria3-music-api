@@ -1,0 +1,21 @@
+# ─── Render Blueprint for Lyria 3 Music API ──────────────────────────────
+# Deploy with: New > Blueprint > Connect this repo
+
+services:
+  - type: web
+    name: lyria3-music-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter  # $7/month — enough for music generation
+    disk:
+      name: lyria3-cookies
+      mountPath: /data/cookies
+      sizeGB: 1
+    envVars:
+      - key: API_KEY
+        generateValue: true
+      - key: COOKIE_DIR
+        value: /data/cookies
+      - key: PORT
+        value: 4000
+    healthCheckPath: /api/health

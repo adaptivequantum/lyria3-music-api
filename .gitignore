@@ -1,0 +1,6 @@
+node_modules/
+.env
+cookies/google-cookies.json
+*.mp3
+*.mp4
+*.png
