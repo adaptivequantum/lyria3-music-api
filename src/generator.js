@@ -243,8 +243,16 @@ async function generateWithPlaywright(job) {
       console.log('[Generator] No consent dialog found (ok)');
     }
     
-    // Check if we're logged in
-    const isLoggedIn = pageState.hasInput && !pageState.hasSignIn;
+    // Check if we're logged in — look for the user avatar or greeting, not sign-in link
+    // (hasSignIn can be a false positive from Google Terms links on the page)
+    const isLoggedIn = await page.evaluate(() => {
+      // If we see a greeting like "Hi Aql" or the input field, we're logged in
+      const bodyText = document.body.innerText;
+      const hasGreeting = /Hi \w+/i.test(bodyText) || /Where should we start/i.test(bodyText);
+      const hasInput = !!document.querySelector('rich-textarea, div[contenteditable="true"], [role="textbox"], .ql-editor');
+      const hasUserAvatar = !!document.querySelector('[aria-label*="Google Account"]');
+      return hasGreeting || hasInput || hasUserAvatar;
+    });
     
     if (!isLoggedIn) {
       const screenshotPath = path.join(os.tmpdir(), `lyria3-not-logged-in-${Date.now()}.png`);
@@ -256,16 +264,33 @@ async function generateWithPlaywright(job) {
     
     console.log(`[Generator] Logged in to Gemini successfully`);
     
-    // Type the prompt into the contenteditable input
+    // Dismiss the welcome/terms dialog if present
+    try {
+      const dismissBtn = await page.$('[aria-label="Close"], button[aria-label="Dismiss"]');
+      if (dismissBtn) {
+        console.log('[Generator] Dismissing welcome dialog...');
+        await dismissBtn.click();
+        await page.waitForTimeout(1000);
+      }
+    } catch (e) {
+      console.log('[Generator] No welcome dialog to dismiss');
+    }
+    
+    // Type the prompt into the input field
     console.log(`[Generator] Typing prompt: ${job.prompt.substring(0, 80)}...`);
     
+    // Try clicking on the input area first — Gemini 3 uses rich-textarea or contenteditable
     const inputSelectors = [
+      'rich-textarea',
       'rich-textarea div[contenteditable="true"]',
       'div[contenteditable="true"]',
+      '.ql-editor',
       '[role="textbox"]',
       'textarea',
       '[aria-label*="prompt" i]',
+      '[aria-label*="Ask Gemini" i]',
       '[aria-label*="message" i]',
+      'p[data-placeholder]',
     ];
     
     let inputFound = false;
@@ -274,7 +299,8 @@ async function generateWithPlaywright(job) {
       if (input) {
         await input.click();
         await page.waitForTimeout(500);
-        await page.keyboard.type(job.prompt, { delay: 20 });
+        // Use keyboard.insertText for faster input, then verify
+        await page.keyboard.insertText(job.prompt);
         inputFound = true;
         console.log(`[Generator] Input found with selector: ${selector}`);
         break;
@@ -282,10 +308,33 @@ async function generateWithPlaywright(job) {
     }
     
     if (!inputFound) {
-      throw new Error('Could not find Gemini input field');
+      // Last resort: try clicking in the center of the page where the input should be
+      console.log('[Generator] No input selector matched, trying click at input area...');
+      const viewport = page.viewportSize();
+      await page.mouse.click(viewport.width / 2, viewport.height / 2 + 50);
+      await page.waitForTimeout(500);
+      await page.keyboard.insertText(job.prompt);
+      inputFound = true;
+      console.log('[Generator] Used fallback click method for input');
     }
     
     await page.waitForTimeout(1000);
+    
+    // Verify text was entered
+    const enteredText = await page.evaluate(() => {
+      const rt = document.querySelector('rich-textarea');
+      if (rt) return rt.innerText?.trim();
+      const ce = document.querySelector('div[contenteditable="true"]');
+      if (ce) return ce.innerText?.trim();
+      return '';
+    });
+    console.log(`[Generator] Text in input field: "${enteredText.substring(0, 80)}..."`);
+    
+    if (!enteredText) {
+      console.warn('[Generator] Input appears empty — retrying with keyboard.type...');
+      await page.keyboard.type(job.prompt, { delay: 15 });
+      await page.waitForTimeout(500);
+    }
     
     // Submit the prompt
     console.log(`[Generator] Submitting prompt...`);
