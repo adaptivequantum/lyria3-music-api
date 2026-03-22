@@ -231,7 +231,9 @@ async function generateWithPlaywright(job) {
     
     // Handle consent/cookie dialogs that might block the page
     try {
-      const consentBtn = await page.$('button:has-text("I agree"), button:has-text("Accept all"), button:has-text("Accept"), [aria-label*="Accept" i], [aria-label*="agree" i]');
+      const consentBtn = await page.$('[aria-label*="Accept" i], [aria-label*="agree" i]') 
+        || await page.locator('button:has-text("I agree")').first().elementHandle().catch(() => null)
+        || await page.locator('button:has-text("Accept all")').first().elementHandle().catch(() => null);
       if (consentBtn) {
         console.log('[Generator] Found consent dialog — clicking Accept...');
         await consentBtn.click();
@@ -802,7 +804,7 @@ export async function debugScreenshot() {
         bodyTextPreview: document.body.innerText.substring(0, 1000),
         hasInput: !!document.querySelector('div[contenteditable="true"], [aria-label*="prompt" i], rich-textarea'),
         hasSignIn: !!document.querySelector('a[href*="accounts.google.com"]'),
-        hasConsentDialog: !!document.querySelector('[aria-label*="consent" i], [aria-label*="agree" i], [aria-label*="accept" i], button:has-text("I agree")'),
+        hasConsentDialog: !!document.querySelector('[aria-label*="consent" i], [aria-label*="agree" i], [aria-label*="accept" i]'),
         allButtons: Array.from(document.querySelectorAll('button, [role="button"]')).slice(0, 20).map(b => ({
           text: b.innerText?.substring(0, 50),
           ariaLabel: b.getAttribute('aria-label'),
