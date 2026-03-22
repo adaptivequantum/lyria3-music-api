@@ -10,10 +10,12 @@
  *   GET  /api/health       — Health check
  *   POST /api/cookies      — Upload Google cookies (JSON array)
  *   GET  /api/jobs         — List recent jobs
+ *   GET  /api/download/:id — Download audio file for completed job
  */
 
 import express from 'express';
 import cors from 'cors';
+import fs from 'fs';
 import { config } from 'dotenv';
 import { generateMusic, getJob, getRecentJobs, checkHealth } from './generator.js';
 import { saveCookies, getCookies } from './cookies.js';
@@ -109,6 +111,33 @@ app.get('/api/status/:id', authenticate, (req, res) => {
 app.get('/api/jobs', authenticate, (req, res) => {
   const jobs = getRecentJobs();
   res.json({ jobs });
+});
+
+// Download audio file for a completed job
+app.get('/api/download/:id', authenticate, (req, res) => {
+  const job = getJob(req.params.id);
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found' });
+  }
+  if (job.status !== 'completed' || !job.audioUrl) {
+    return res.status(400).json({ error: `Job not completed yet (status: ${job.status})` });
+  }
+  
+  // If audioUrl is an actual URL (S3/CDN), redirect to it
+  if (job.audioUrl.startsWith('http')) {
+    return res.redirect(job.audioUrl);
+  }
+  
+  // If audioUrl is a local file path (local:///tmp/...)
+  const filePath = job.audioUrl.replace('local://', '');
+  if (!fs.existsSync(filePath)) {
+    return res.status(410).json({ error: 'Audio file no longer available on disk' });
+  }
+  
+  const ext = filePath.endsWith('.mp3') ? 'mp3' : 'mp4';
+  res.setHeader('Content-Type', ext === 'mp3' ? 'audio/mpeg' : 'audio/mp4');
+  res.setHeader('Content-Disposition', `attachment; filename="tarab-ai-${req.params.id}.${ext}"`);
+  fs.createReadStream(filePath).pipe(res);
 });
 
 // Upload cookies
