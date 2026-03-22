@@ -18,4 +18,18 @@ services:
         value: /data/cookies
       - key: PORT
         value: 4000
+      # ─── Cookie Persistence (survives redeploys even without persistent disk) ───
+      # Set this to a base64-encoded JSON array of Google cookies.
+      # The app will auto-decode and write to disk on startup.
+      # Every POST /api/cookies call will auto-update this value via the Render API
+      # if RENDER_API_KEY and RENDER_SERVICE_ID are also set.
+      - key: GOOGLE_COOKIES_B64
+        sync: false  # User must set this manually — contains sensitive auth data
+      # ─── Render API credentials for auto-updating GOOGLE_COOKIES_B64 ──────────
+      # Get API key: https://dashboard.render.com/u/settings/api-keys
+      # Get service ID: from the Render dashboard URL for this service
+      - key: RENDER_API_KEY
+        sync: false  # User must set this manually
+      - key: RENDER_SERVICE_ID
+        sync: false  # User must set this manually
     healthCheckPath: /api/health

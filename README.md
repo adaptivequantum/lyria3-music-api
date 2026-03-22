@@ -141,6 +141,33 @@ Google cookies typically last 2-4 weeks. When they expire:
 2. Export fresh cookies
 3. POST to `/api/cookies` again
 
+## Cookie Persistence (Surviving Render Redeploys)
+
+Render's ephemeral filesystem wipes the `/data/cookies` disk on every redeploy unless a paid persistent disk is attached. To ensure cookies survive redeploys, the API supports a **`GOOGLE_COOKIES_B64` environment variable fallback**:
+
+### How It Works
+
+1. **On startup**: If no cookie file exists on disk, the app decodes `GOOGLE_COOKIES_B64` (base64 JSON) and writes it to disk automatically.
+2. **On POST /api/cookies**: The app saves to disk AND (if `RENDER_API_KEY` + `RENDER_SERVICE_ID` are set) automatically updates the `GOOGLE_COOKIES_B64` env var on Render via the Render API — so the next redeploy will load the latest cookies.
+
+### Setup (One-Time)
+
+**Step 1:** Generate the initial base64 value from your cookies file:
+```bash
+python3 -c "import base64; print(base64.b64encode(open('google_cookies.json','rb').read()).decode())"
+```
+
+**Step 2:** Set `GOOGLE_COOKIES_B64` in your Render dashboard → Environment Variables.
+
+**Step 3 (optional, for auto-update):** Set `RENDER_API_KEY` and `RENDER_SERVICE_ID` so the app can update the env var automatically whenever new cookies are uploaded:
+- `RENDER_API_KEY`: Get from https://dashboard.render.com/u/settings/api-keys
+- `RENDER_SERVICE_ID`: The `srv-XXXXXXXXXX` ID from your service's Render dashboard URL
+
+After this setup, the cookie refresh flow is:
+1. Run Playwright login → export fresh cookies
+2. POST to `/api/cookies` → cookies saved to disk + env var updated automatically
+3. Future redeploys → cookies loaded from `GOOGLE_COOKIES_B64` env var on startup
+
 ## Environment Variables
 
 | Variable | Required | Default | Description |
@@ -148,6 +175,9 @@ Google cookies typically last 2-4 weeks. When they expire:
 | `API_KEY` | Yes | `tarab-dev-key-change-me` | API authentication key |
 | `PORT` | No | `4000` | Server port |
 | `COOKIE_DIR` | No | `./cookies` | Cookie storage path |
+| `GOOGLE_COOKIES_B64` | Recommended | - | Base64-encoded Google cookies JSON (survives redeploys) |
+| `RENDER_API_KEY` | Optional | - | Render API key for auto-updating `GOOGLE_COOKIES_B64` |
+| `RENDER_SERVICE_ID` | Optional | - | Render service ID (e.g. `srv-abc123`) |
 | `S3_BUCKET` | No | - | S3 bucket for music files |
 | `S3_REGION` | No | `us-east-1` | S3 region |
 | `S3_ACCESS_KEY` | No | - | S3 access key |
