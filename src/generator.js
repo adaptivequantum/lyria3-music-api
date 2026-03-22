@@ -3,6 +3,9 @@
  * 
  * Uses Playwright browser automation to generate music via Google Gemini.
  * Manages a job queue, browser lifecycle, and result handling.
+ * 
+ * Audio capture strategy: intercept network responses for audio/video content
+ * types instead of trying to re-fetch URLs from the DOM (which returns HTML).
  */
 
 import { chromium } from 'playwright';
@@ -123,6 +126,7 @@ async function getBrowser() {
       '--disable-setuid-sandbox',
       '--disable-blink-features=AutomationControlled',
       '--disable-features=IsolateOrigins,site-per-process',
+      '--autoplay-policy=no-user-gesture-required',
     ],
   });
   
@@ -153,7 +157,7 @@ async function createAuthenticatedContext(browser) {
       path: c.path || '/',
       secure: c.secure ?? true,
       httpOnly: c.httpOnly ?? false,
-      expires: c.expires > 0 ? c.expires : undefined,
+      expires: c.expirationDate > 0 ? c.expirationDate : (c.expires > 0 ? c.expires : undefined),
     }));
   
   if (validCookies.length > 0) {
@@ -164,6 +168,42 @@ async function createAuthenticatedContext(browser) {
   return context;
 }
 
+// ─── Audio Content Validation ───────────────────────────────────────────────
+
+function isAudioContent(buffer) {
+  if (!buffer || buffer.length < 12) return false;
+  
+  // Check magic bytes for common audio/video formats
+  const header = buffer.slice(0, 12);
+  
+  // MP3: starts with ID3 tag or 0xFF 0xFB sync bytes
+  if (header[0] === 0x49 && header[1] === 0x44 && header[2] === 0x33) return true; // ID3
+  if (header[0] === 0xFF && (header[1] & 0xE0) === 0xE0) return true; // MP3 sync
+  
+  // MP4/M4A: ftyp box
+  if (header[4] === 0x66 && header[5] === 0x74 && header[6] === 0x79 && header[7] === 0x70) return true;
+  
+  // WebM: EBML header (0x1A 0x45 0xDF 0xA3)
+  if (header[0] === 0x1A && header[1] === 0x45 && header[2] === 0xDF && header[3] === 0xA3) return true;
+  
+  // OGG: OggS
+  if (header[0] === 0x4F && header[1] === 0x67 && header[2] === 0x67 && header[3] === 0x53) return true;
+  
+  // WAV: RIFF
+  if (header[0] === 0x52 && header[1] === 0x49 && header[2] === 0x46 && header[3] === 0x46) return true;
+  
+  // FLAC
+  if (header[0] === 0x66 && header[1] === 0x4C && header[2] === 0x61 && header[3] === 0x43) return true;
+  
+  return false;
+}
+
+function isHtmlContent(buffer) {
+  if (!buffer || buffer.length < 20) return false;
+  const start = buffer.slice(0, 100).toString('utf-8').toLowerCase().trim();
+  return start.includes('<!doctype') || start.includes('<html') || start.includes('<?xml');
+}
+
 // ─── Core Generation ────────────────────────────────────────────────────────
 
 async function generateWithPlaywright(job) {
@@ -171,15 +211,74 @@ async function generateWithPlaywright(job) {
   const context = await createAuthenticatedContext(browser);
   let page = null;
   
+  // Captured audio data from network interception
+  let capturedAudioBuffer = null;
+  let capturedAudioUrl = null;
+  
   try {
     page = await context.newPage();
+    
+    // ── STRATEGY 1: Network interception ──
+    // Intercept all responses and capture audio/video content as it flows through
+    page.on('response', async (response) => {
+      try {
+        const url = response.url();
+        const contentType = response.headers()['content-type'] || '';
+        const status = response.status();
+        
+        // Skip non-success responses
+        if (status < 200 || status >= 300) return;
+        
+        // Check if this is audio/video content
+        const isAudioType = contentType.includes('audio/') || 
+                           contentType.includes('video/') ||
+                           contentType.includes('application/octet-stream');
+        
+        // Also check URL patterns for Google media delivery
+        const isMediaUrl = url.includes('play.google.com') ||
+                          url.includes('usercontent.google') ||
+                          url.includes('googleusercontent.com') ||
+                          url.includes('music.google') ||
+                          url.includes('/blob') ||
+                          url.includes('lh3.google') ||
+                          url.includes('encrypted-tbn') ||
+                          (url.includes('google') && (url.includes('/media') || url.includes('/audio') || url.includes('/video')));
+        
+        if (isAudioType || isMediaUrl) {
+          try {
+            const body = await response.body();
+            
+            // Validate it's actually audio, not HTML
+            if (body.length > 10000 && isAudioContent(body) && !isHtmlContent(body)) {
+              console.log(`[Generator] INTERCEPTED audio: ${url.substring(0, 100)}... (${body.length} bytes, type: ${contentType})`);
+              capturedAudioBuffer = body;
+              capturedAudioUrl = url;
+            } else if (isAudioType && body.length > 10000 && !isHtmlContent(body)) {
+              // Trust content-type header if it says audio and it's not HTML
+              console.log(`[Generator] INTERCEPTED audio (by content-type): ${url.substring(0, 100)}... (${body.length} bytes, type: ${contentType})`);
+              capturedAudioBuffer = body;
+              capturedAudioUrl = url;
+            }
+          } catch (e) {
+            // Some responses can't be read (streaming, etc.) — that's OK
+          }
+        }
+      } catch (e) {
+        // Ignore errors in response handler
+      }
+    });
     
     // Navigate to Gemini
     console.log(`[Generator] Navigating to Gemini...`);
     await page.goto(GEMINI_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(3000);
     
-    // Click "Create music" mode button
+    // Take a screenshot to see what we're working with
+    const navScreenshot = path.join(os.tmpdir(), `lyria3-nav-${job.id}.png`);
+    await page.screenshot({ path: navScreenshot });
+    console.log(`[Generator] Navigation screenshot: ${navScreenshot}`);
+    
+    // Click "Create music" mode button if available
     console.log(`[Generator] Activating music creation mode...`);
     const musicButton = await page.$('button:has-text("Create music"), [aria-label*="music"], [data-test-id*="music"]');
     if (musicButton) {
@@ -231,52 +330,138 @@ async function generateWithPlaywright(job) {
     console.log(`[Generator] Submitting prompt...`);
     await page.keyboard.press('Enter');
     
-    // Wait for music generation (30-120 seconds)
+    // Wait for music generation — check both network capture and DOM
     console.log(`[Generator] Waiting for music generation (up to 3 minutes)...`);
     
     const startTime = Date.now();
-    let audioUrl = null;
     
     while (Date.now() - startTime < GENERATION_TIMEOUT) {
       await page.waitForTimeout(5000);
       
-      // Check for audio/video elements with src
-      audioUrl = await page.evaluate(() => {
-        const media = document.querySelectorAll('audio source, video source, audio[src], video[src]');
+      // Check if network interception already captured audio
+      if (capturedAudioBuffer && capturedAudioBuffer.length > 10000) {
+        console.log(`[Generator] Audio captured via network interception! (${capturedAudioBuffer.length} bytes)`);
+        break;
+      }
+      
+      // Also check DOM for audio elements (as a signal that generation is done)
+      const hasAudioElement = await page.evaluate(() => {
+        const media = document.querySelectorAll('audio, video, audio source, video source');
         for (const el of media) {
-          const src = el.getAttribute('src') || '';
-          if (src && (src.includes('usercontent.google') || src.includes('blob:') || src.includes('googleusercontent'))) {
-            return src;
-          }
+          const src = el.getAttribute('src') || el.querySelector('source')?.getAttribute('src') || '';
+          if (src) return true;
         }
-        
-        const links = document.querySelectorAll('a[href*="download"], a[href*="usercontent"]');
-        for (const link of links) {
-          const href = link.getAttribute('href') || '';
-          if (href && href.includes('google')) {
-            return href;
-          }
-        }
-        
-        const playButtons = document.querySelectorAll('[data-track-url], [data-audio-url], [data-src]');
-        for (const btn of playButtons) {
-          const url = btn.getAttribute('data-track-url') || btn.getAttribute('data-audio-url') || btn.getAttribute('data-src') || '';
-          if (url) return url;
-        }
-        
-        return null;
+        // Check for play buttons that indicate audio is ready
+        const playBtns = document.querySelectorAll('[aria-label*="Play"], [aria-label*="play"], button[data-track-url]');
+        if (playBtns.length > 0) return true;
+        return false;
       });
       
-      if (audioUrl) {
-        console.log(`[Generator] Found audio URL: ${audioUrl.substring(0, 80)}...`);
-        break;
+      if (hasAudioElement && !capturedAudioBuffer) {
+        console.log(`[Generator] Audio element detected in DOM, clicking play to trigger download...`);
+        
+        // Click play button to trigger the audio download (which we'll intercept)
+        await page.evaluate(() => {
+          const playBtns = document.querySelectorAll('[aria-label*="Play"], [aria-label*="play"], button[data-track-url]');
+          for (const btn of playBtns) {
+            btn.click();
+            break;
+          }
+          // Also try clicking audio/video elements directly
+          const media = document.querySelectorAll('audio, video');
+          for (const el of media) {
+            try { el.play(); } catch(e) {}
+          }
+        });
+        
+        // Wait a bit for the play action to trigger network requests
+        await page.waitForTimeout(5000);
+        
+        if (capturedAudioBuffer && capturedAudioBuffer.length > 10000) {
+          console.log(`[Generator] Audio captured after clicking play! (${capturedAudioBuffer.length} bytes)`);
+          break;
+        }
+        
+        // ── STRATEGY 2: Direct blob extraction from audio/video element ──
+        // If network interception didn't catch it (e.g., blob: URL loaded before our listener),
+        // try to extract the audio data directly from the media element
+        console.log(`[Generator] Network interception didn't capture audio. Trying direct blob extraction...`);
+        
+        const blobData = await page.evaluate(async () => {
+          // Find audio/video elements
+          const mediaElements = document.querySelectorAll('audio, video');
+          for (const media of mediaElements) {
+            const src = media.src || media.querySelector('source')?.src || '';
+            
+            if (src.startsWith('blob:')) {
+              // For blob URLs, we need to use MediaRecorder or fetch the blob
+              try {
+                const response = await fetch(src);
+                const blob = await response.blob();
+                const arrayBuffer = await blob.arrayBuffer();
+                const bytes = Array.from(new Uint8Array(arrayBuffer));
+                return { bytes, type: blob.type, size: blob.size, source: 'blob-fetch' };
+              } catch (e) {
+                console.log('Blob fetch failed:', e.message);
+              }
+            } else if (src.startsWith('http')) {
+              try {
+                const response = await fetch(src, { credentials: 'include' });
+                const contentType = response.headers.get('content-type') || '';
+                if (contentType.includes('audio') || contentType.includes('video') || contentType.includes('octet-stream')) {
+                  const blob = await response.blob();
+                  const arrayBuffer = await blob.arrayBuffer();
+                  const bytes = Array.from(new Uint8Array(arrayBuffer));
+                  return { bytes, type: contentType, size: blob.size, source: 'http-fetch' };
+                }
+              } catch (e) {
+                console.log('HTTP fetch failed:', e.message);
+              }
+            }
+          }
+          
+          // Try finding download links
+          const downloadLinks = document.querySelectorAll('a[download], a[href*="download"]');
+          for (const link of downloadLinks) {
+            const href = link.href;
+            if (href && href.startsWith('http')) {
+              try {
+                const response = await fetch(href, { credentials: 'include' });
+                const contentType = response.headers.get('content-type') || '';
+                const blob = await response.blob();
+                const arrayBuffer = await blob.arrayBuffer();
+                const bytes = Array.from(new Uint8Array(arrayBuffer));
+                return { bytes, type: contentType, size: blob.size, source: 'download-link' };
+              } catch (e) {
+                console.log('Download link fetch failed:', e.message);
+              }
+            }
+          }
+          
+          return null;
+        });
+        
+        if (blobData && blobData.bytes && blobData.bytes.length > 10000) {
+          const buf = Buffer.from(blobData.bytes);
+          if (isAudioContent(buf) && !isHtmlContent(buf)) {
+            console.log(`[Generator] Got audio via ${blobData.source}: ${blobData.size} bytes, type: ${blobData.type}`);
+            capturedAudioBuffer = buf;
+            break;
+          } else if (!isHtmlContent(buf) && blobData.type && (blobData.type.includes('audio') || blobData.type.includes('video'))) {
+            console.log(`[Generator] Got audio via ${blobData.source} (trusted content-type): ${blobData.size} bytes, type: ${blobData.type}`);
+            capturedAudioBuffer = buf;
+            break;
+          } else {
+            console.warn(`[Generator] Blob extraction returned non-audio content (${blobData.size} bytes, type: ${blobData.type})`);
+          }
+        }
       }
       
       // Check for error messages
       const hasError = await page.evaluate(() => {
-        const errorTexts = ['something went wrong', 'try again', 'unable to generate'];
+        const errorTexts = ['something went wrong', 'try again', 'unable to generate', 'can\'t generate'];
         const bodyText = document.body.innerText.toLowerCase();
-        return errorTexts.some(t => bodyText.includes(t) && bodyText.indexOf(t) > bodyText.length - 500);
+        return errorTexts.some(t => bodyText.includes(t));
       });
       
       if (hasError) {
@@ -284,35 +469,51 @@ async function generateWithPlaywright(job) {
       }
       
       const elapsed = Math.round((Date.now() - startTime) / 1000);
-      console.log(`[Generator] Still waiting... (${elapsed}s elapsed)`);
+      console.log(`[Generator] Still waiting... (${elapsed}s elapsed, captured: ${capturedAudioBuffer ? capturedAudioBuffer.length + ' bytes' : 'none'})`);
     }
     
-    if (!audioUrl) {
+    // Final check — did we capture anything?
+    if (!capturedAudioBuffer || capturedAudioBuffer.length < 10000) {
+      // Take debug screenshot
       const screenshotPath = path.join(os.tmpdir(), `lyria3-debug-${Date.now()}.png`);
       await page.screenshot({ path: screenshotPath, fullPage: true });
       console.warn(`[Generator] Debug screenshot saved: ${screenshotPath}`);
-      throw new Error('Music generation timed out — no audio URL found after 3 minutes');
+      
+      // Log page state for debugging
+      const pageState = await page.evaluate(() => {
+        const audioEls = document.querySelectorAll('audio, video');
+        const sources = [];
+        audioEls.forEach(el => {
+          sources.push({
+            tag: el.tagName,
+            src: el.src || '',
+            childSources: Array.from(el.querySelectorAll('source')).map(s => s.src),
+          });
+        });
+        return {
+          title: document.title,
+          audioElements: sources,
+          bodyTextLength: document.body.innerText.length,
+          hasPlayButton: !!document.querySelector('[aria-label*="Play"], [aria-label*="play"]'),
+        };
+      });
+      console.warn(`[Generator] Page state at timeout:`, JSON.stringify(pageState));
+      
+      throw new Error(`Music generation failed — no audio captured after 3 minutes. Page: ${pageState.title}, Audio elements: ${pageState.audioElements.length}`);
     }
     
-    // Download the audio/video file
+    // Validate the captured audio
+    if (isHtmlContent(capturedAudioBuffer)) {
+      throw new Error('Captured content is HTML, not audio — Gemini session may have expired');
+    }
+    
+    // Save to temp file
     job.status = 'downloading';
-    const tempFile = path.join(os.tmpdir(), `lyria3-${job.id}-${Date.now()}.mp4`);
+    const ext = isAudioContent(capturedAudioBuffer) ? '.mp4' : '.mp4'; // Gemini typically outputs mp4
+    const tempFile = path.join(os.tmpdir(), `lyria3-${job.id}-${Date.now()}${ext}`);
+    fs.writeFileSync(tempFile, capturedAudioBuffer);
     
-    const buffer = await page.evaluate(async (url) => {
-      const response = await fetch(url);
-      const blob = await response.blob();
-      const arrayBuffer = await blob.arrayBuffer();
-      return Array.from(new Uint8Array(arrayBuffer));
-    }, audioUrl);
-    
-    fs.writeFileSync(tempFile, Buffer.from(buffer));
-    
-    const fileSize = fs.statSync(tempFile).size;
-    console.log(`[Generator] Downloaded ${fileSize} bytes to ${tempFile}`);
-    
-    if (fileSize < 1000) {
-      throw new Error(`Downloaded file too small (${fileSize} bytes) — likely not valid audio`);
-    }
+    console.log(`[Generator] Saved ${capturedAudioBuffer.length} bytes to ${tempFile}`);
     
     return tempFile;
     
@@ -369,7 +570,6 @@ async function uploadToStorage(filePath, jobId) {
   const S3_SECRET_KEY = process.env.S3_SECRET_KEY;
   
   if (S3_BUCKET && S3_ACCESS_KEY) {
-    // Use AWS CLI or SDK to upload
     const key = `lyria3-music/${jobId}-${Date.now()}.mp3`;
     try {
       execSync(
@@ -408,7 +608,7 @@ async function uploadToStorage(filePath, jobId) {
     }
   }
   
-  // Fallback: serve the file locally (not ideal for production)
+  // Fallback: serve the file locally via /api/download/:id
   console.warn('[Generator] No S3/upload configured. File saved locally:', filePath);
   return `local://${filePath}`;
 }
@@ -466,7 +666,6 @@ async function processJob(jobId) {
       job.status = 'failed';
       job.error = error.message;
       
-      // Webhook callback for failure
       if (job.callbackUrl) {
         try {
           await fetch(job.callbackUrl, {
@@ -518,7 +717,7 @@ export async function generateMusic(params) {
     attempts: 0,
     createdAt: Date.now(),
     callbackUrl: params.callbackUrl || null,
-    params, // Store original params for reference
+    params,
   };
   
   jobs.set(id, job);
@@ -560,7 +759,6 @@ export async function checkHealth() {
     execSync('which chromium || which chromium-browser || which google-chrome', { timeout: 5000 });
     browserOk = true;
   } catch {
-    // Check if Playwright has its own browser
     try {
       const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
       await browser.close();
