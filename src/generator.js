@@ -336,9 +336,31 @@ async function generateWithPlaywright(job) {
       await page.waitForTimeout(500);
     }
     
-    // Submit the prompt
+    // Submit the prompt — try Enter key first, then look for submit button
     console.log(`[Generator] Submitting prompt...`);
-    await page.keyboard.press('Enter');
+    
+    // Try clicking the submit/send button directly
+    const submitBtn = await page.$('[aria-label="Send message"], [aria-label*="Submit" i], [aria-label*="Send" i], button[data-testid="send-button"]');
+    if (submitBtn) {
+      console.log('[Generator] Found submit button — clicking it');
+      await submitBtn.click();
+    } else {
+      console.log('[Generator] No submit button found — pressing Enter');
+      await page.keyboard.press('Enter');
+    }
+    
+    // Wait a moment and check if the page changed (prompt was accepted)
+    await page.waitForTimeout(3000);
+    const afterSubmit = await page.evaluate(() => {
+      const bodyText = document.body.innerText;
+      return {
+        hasGenerating: /generating|creating|working/i.test(bodyText),
+        hasMusic: /music|track|song/i.test(bodyText),
+        bodyPreview: bodyText.substring(0, 500),
+      };
+    });
+    console.log(`[Generator] After submit — generating: ${afterSubmit.hasGenerating}, hasMusic: ${afterSubmit.hasMusic}`);
+    console.log(`[Generator] After submit body: ${afterSubmit.bodyPreview.substring(0, 300)}`);
     
     // ─── WAIT FOR MUSIC GENERATION ──────────────────────────────────
     // The track is ready when a <video> element appears with a src from
@@ -409,14 +431,45 @@ async function generateWithPlaywright(job) {
       }
       
       const elapsed = Math.round((Date.now() - startTime) / 1000);
+      
+      // Every 30 seconds, log what the page shows
+      if (elapsed % 30 === 0 && elapsed > 0) {
+        const pageCheck = await page.evaluate(() => {
+          const bodyText = document.body.innerText;
+          return {
+            hasVideo: !!document.querySelector('video'),
+            hasAudio: !!document.querySelector('audio'),
+            hasGenerating: /generating|creating your track/i.test(bodyText),
+            hasError: /something went wrong|try again later/i.test(bodyText),
+            responsePreview: bodyText.substring(bodyText.length - 500),
+          };
+        });
+        console.log(`[Generator] Page check at ${elapsed}s: video=${pageCheck.hasVideo}, audio=${pageCheck.hasAudio}, generating=${pageCheck.hasGenerating}, error=${pageCheck.hasError}`);
+        console.log(`[Generator] Page tail: ${pageCheck.responsePreview.substring(0, 200)}`);
+      }
+      
       console.log(`[Generator] Still waiting... (${elapsed}s elapsed)`);
     }
     
     if (!videoSrc) {
-      // Last attempt: screenshot and check one more time
+      // Last attempt: screenshot and log page state for remote debugging
       const screenshotPath = path.join(os.tmpdir(), `lyria3-timeout-${job.id}-${Date.now()}.png`);
       await page.screenshot({ path: screenshotPath, fullPage: true });
       console.error(`[Generator] Timeout screenshot: ${screenshotPath}`);
+      
+      // Log the full page state on timeout for debugging
+      const timeoutState = await page.evaluate(() => {
+        return {
+          url: window.location.href,
+          title: document.title,
+          bodyText: document.body.innerText.substring(0, 2000),
+          allVideos: document.querySelectorAll('video').length,
+          allAudios: document.querySelectorAll('audio').length,
+          allIframes: document.querySelectorAll('iframe').length,
+        };
+      });
+      console.error(`[Generator] TIMEOUT STATE: url=${timeoutState.url}, videos=${timeoutState.allVideos}, audios=${timeoutState.allAudios}, iframes=${timeoutState.allIframes}`);
+      console.error(`[Generator] TIMEOUT BODY: ${timeoutState.bodyText.substring(0, 1000)}`);
       
       // One final check
       videoSrc = await page.evaluate(() => {
