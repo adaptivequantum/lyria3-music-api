@@ -17,7 +17,7 @@ import express from 'express';
 import cors from 'cors';
 import fs from 'fs';
 import { config } from 'dotenv';
-import { generateMusic, getJob, getRecentJobs, checkHealth } from './generator.js';
+import { generateMusic, getJob, getRecentJobs, checkHealth, debugScreenshot } from './generator.js';
 import { saveCookies, getCookies } from './cookies.js';
 
 config();
@@ -151,6 +151,17 @@ app.post('/api/cookies', authenticate, async (req, res) => {
     res.json({ success: true, count: cookies.length, message: 'Cookies saved successfully' });
   } catch (err) {
     console.error('[API] Cookie save error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Debug screenshot — captures what Gemini looks like on this server
+app.get('/api/debug-screenshot', authenticate, async (req, res) => {
+  try {
+    const { screenshot, pageInfo } = await debugScreenshot();
+    res.json({ success: true, pageInfo, screenshotBase64: screenshot.toString('base64') });
+  } catch (err) {
+    console.error('[API] Debug screenshot error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });

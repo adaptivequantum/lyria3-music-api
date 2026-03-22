@@ -216,22 +216,40 @@ async function generateWithPlaywright(job) {
     await page.goto(GEMINI_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(3000);
     
-    // Check if we're logged in (look for sign-in button or user avatar)
-    const isLoggedIn = await page.evaluate(() => {
-      const bodyText = document.body.innerText.toLowerCase();
-      // If we see "sign in" prominently, we're not logged in
-      const signInBtn = document.querySelector('a[href*="accounts.google.com/ServiceLogin"]');
-      if (signInBtn) return false;
-      // If we see the prompt input, we're logged in
-      const input = document.querySelector('div[contenteditable="true"], [aria-label*="prompt" i]');
-      return !!input;
+    // Log page state for debugging
+    const pageState = await page.evaluate(() => {
+      return {
+        url: window.location.href,
+        title: document.title,
+        bodyPreview: document.body.innerText.substring(0, 300),
+        hasInput: !!document.querySelector('div[contenteditable="true"], [aria-label*="prompt" i], rich-textarea'),
+        hasSignIn: !!document.querySelector('a[href*="accounts.google.com/ServiceLogin"]'),
+      };
     });
+    console.log(`[Generator] Page state: url=${pageState.url}, title=${pageState.title}, hasInput=${pageState.hasInput}, hasSignIn=${pageState.hasSignIn}`);
+    console.log(`[Generator] Page body preview: ${pageState.bodyPreview.substring(0, 200)}`);
+    
+    // Handle consent/cookie dialogs that might block the page
+    try {
+      const consentBtn = await page.$('button:has-text("I agree"), button:has-text("Accept all"), button:has-text("Accept"), [aria-label*="Accept" i], [aria-label*="agree" i]');
+      if (consentBtn) {
+        console.log('[Generator] Found consent dialog — clicking Accept...');
+        await consentBtn.click();
+        await page.waitForTimeout(2000);
+      }
+    } catch (e) {
+      console.log('[Generator] No consent dialog found (ok)');
+    }
+    
+    // Check if we're logged in
+    const isLoggedIn = pageState.hasInput && !pageState.hasSignIn;
     
     if (!isLoggedIn) {
       const screenshotPath = path.join(os.tmpdir(), `lyria3-not-logged-in-${Date.now()}.png`);
       await page.screenshot({ path: screenshotPath });
-      console.error(`[Generator] NOT LOGGED IN! Screenshot: ${screenshotPath}`);
-      throw new Error('Not logged into Gemini — cookies may be expired. Re-upload fresh cookies via POST /api/cookies');
+      console.error(`[Generator] NOT LOGGED IN! url=${pageState.url}, title=${pageState.title}`);
+      console.error(`[Generator] Body preview: ${pageState.bodyPreview}`);
+      throw new Error(`Not logged into Gemini — page shows: ${pageState.title}. Cookies may be expired.`);
     }
     
     console.log(`[Generator] Logged in to Gemini successfully`);
@@ -761,6 +779,44 @@ export function getRecentJobs() {
       createdAt: j.createdAt,
       attempts: j.attempts,
     }));
+}
+
+/**
+ * Debug screenshot — opens Gemini with cookies and captures what the page looks like.
+ * Useful for remote debugging when generation fails.
+ */
+export async function debugScreenshot() {
+  const browser = await getBrowser();
+  const context = await createAuthenticatedContext(browser);
+  let page = null;
+  
+  try {
+    page = await context.newPage();
+    await page.goto(GEMINI_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(5000);
+    
+    const pageInfo = await page.evaluate(() => {
+      return {
+        url: window.location.href,
+        title: document.title,
+        bodyTextPreview: document.body.innerText.substring(0, 1000),
+        hasInput: !!document.querySelector('div[contenteditable="true"], [aria-label*="prompt" i], rich-textarea'),
+        hasSignIn: !!document.querySelector('a[href*="accounts.google.com"]'),
+        hasConsentDialog: !!document.querySelector('[aria-label*="consent" i], [aria-label*="agree" i], [aria-label*="accept" i], button:has-text("I agree")'),
+        allButtons: Array.from(document.querySelectorAll('button, [role="button"]')).slice(0, 20).map(b => ({
+          text: b.innerText?.substring(0, 50),
+          ariaLabel: b.getAttribute('aria-label'),
+          classes: b.className?.substring(0, 100),
+        })),
+      };
+    });
+    
+    const screenshot = await page.screenshot({ fullPage: true });
+    return { screenshot, pageInfo };
+  } finally {
+    if (page) await page.close().catch(() => {});
+    await context.close().catch(() => {});
+  }
 }
 
 export async function checkHealth() {
